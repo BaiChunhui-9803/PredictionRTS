@@ -44,14 +44,16 @@ class KGDecisionHelper:
     Provides action recommendations and trajectory predictions based on the knowledge graph.
     """
 
-    def __init__(self, kg_path: str):
+    def __init__(self, kg_path: str, cfg=None):
         """
         Initialize the helper.
 
         Args:
             kg_path: Path to knowledge graph pickle file
+            cfg: Optional config dict (with 'paths' key). If None, uses get_config().
         """
         self.kg_path = kg_path
+        self.cfg = cfg
         self.kg = DecisionKnowledgeGraph.load(kg_path)
         self.transitions: Dict = None
         self._load_transitions()
@@ -85,16 +87,21 @@ class KGDecisionHelper:
         from src import get_config
         from src.data.loader import DataLoader
 
-        cfg = get_config()
+        if self.cfg is not None:
+            cfg = self.cfg
+        else:
+            cfg = get_config()
+
         loader = DataLoader(cfg)
 
         state_episodes = loader.dt_data["states"]
 
-        data_root = cfg.get(
+        paths_config = cfg.get("paths", {}) if isinstance(cfg, dict) else {}
+        data_root = paths_config.get(
             "data_root", "D:/白春辉/实验平台/pymarl/results_HRL_new/Q-bktree"
         )
-        map_id = cfg.get("map_id", "MarineMicro_MvsM_4")
-        data_id = cfg.get("data_id", "6")
+        map_id = paths_config.get("map_id", "MarineMicro_MvsM_4")
+        data_id = paths_config.get("data_id", "6")
 
         import csv
 

@@ -1,7 +1,3 @@
-from structure.state_distance.custom_distance_sc2 import CustomDistance
-
-custom_distance = CustomDistance(threshold=0.5)
-
 class ClusterNode:
     def __init__(self, state, cluster_id):
         self.state = state
@@ -14,6 +10,7 @@ class ClusterNode:
 
     def add_state(self, state):
         self.state_list.append(state)
+
 
 class BKTree:
     def __init__(self, distance_func, distance_index=0):
@@ -42,17 +39,46 @@ class BKTree:
                 return node.cluster_id
             for d, child in node.children.items():
                 if abs(d - dist) < threshold:
-                    result = search(child, self.distance_func(state, child.state)[self.distance_index])
+                    result = search(
+                        child,
+                        self.distance_func(state, child.state)[self.distance_index],
+                    )
                     if result is not None:
                         return result
             return None
 
         if self.root is None:
             return None
-        return search(self.root, self.distance_func(state, self.root.state)[self.distance_index])
+        return search(
+            self.root, self.distance_func(state, self.root.state)[self.distance_index]
+        )
+
+    def query_nearest(self, state):
+        best_id = None
+        best_dist = float("inf")
+
+        def search(node, dist):
+            nonlocal best_id, best_dist
+            if dist < best_dist:
+                best_dist = dist
+                best_id = node.cluster_id
+            for d, child in node.children.items():
+                if abs(d - dist) < best_dist:
+                    search(
+                        child,
+                        self.distance_func(state, child.state)[self.distance_index],
+                    )
+
+        if self.root is None:
+            return None, float("inf")
+        search(
+            self.root, self.distance_func(state, self.root.state)[self.distance_index]
+        )
+        return best_id, best_dist
 
     def get_next_cluster_id(self):
         return self.next_cluster_id
+
 
 def classify_new_state(new_state, bktree, threshold=1.0):
     cluster_id = bktree.query(new_state, threshold)
@@ -64,6 +90,7 @@ def classify_new_state(new_state, bktree, threshold=1.0):
         bktree.insert(new_node, bktree.root)
         return new_cluster_id
 
+
 def find_max_cluster_id(node, max_cluster_id):
     """
     递归查找 BKTree 中最大的 cluster_id
@@ -73,6 +100,7 @@ def find_max_cluster_id(node, max_cluster_id):
 
     for child in node.children.values():
         find_max_cluster_id(child, max_cluster_id)
+
 
 def get_max_cluster_id(bk_tree):
     """

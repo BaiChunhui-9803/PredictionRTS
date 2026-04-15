@@ -1,0 +1,4 @@
+,action_ATK_nearest,action_ATK_clu_nearest,action_ATK_nearest_weakest,action_ATK_clu_nearest_weakest,action_ATK_threatening,action_DEF_clu_nearest,action_MIX_gather,action_MIX_lure,action_MIX_sacrifice_lure,do_randomly,do_nothing
+0F0F0F,0.33180000000000004,0.0,1.5217999999999998,-0.68,2.02,-0.5199999999999999,0.0,0.0,0.0,2.02,0.0
+0FF00F,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,-0.1481999999999999
+F00F0F,0.0,0.0,0.0,0.0,0.0,0.0,1.8618000000000003,0.0,0.0,0.0,0.0
