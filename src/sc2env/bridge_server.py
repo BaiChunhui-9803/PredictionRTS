@@ -37,7 +37,6 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
-from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -152,20 +151,6 @@ class LogEntry:
             "message": self.message,
             "seq": self.seq,
         }
-
-
-@dataclass
-class EpisodeRecord:
-    id: int
-    result: str = ""
-    score: float = 0.0
-    markov_flow: List[Tuple[int, str]] = field(default_factory=list)
-    events: List[Dict[str, Any]] = field(default_factory=list)
-    plans: List[Dict[str, Any]] = field(default_factory=list)
-    timestamp: str = ""
-    mode: str = ""
-    steps: int = 0
-    match_mode: str = ""
 
 
 def _parse_state_id(obs: Dict[str, Any]) -> Optional[int]:
@@ -297,18 +282,12 @@ class BridgeServer:
         self._last_obs_state: Optional[int] = None
         self._nid_norm_states: Dict[int, dict] = {}
 
-        self._episodes: List[EpisodeRecord] = []
-        self._episode_counter: int = 0
-        self._episode_buffer: List[Dict[str, Any]] = []
         self._current_plans: List[Dict[str, Any]] = []
         self._prev_end_game_flag: bool = False
-        self._last_score: float = 0.0
 
         self._history_store: Dict[int, List[Dict[str, Any]]] = {}
         self._history_meta: Dict[int, Dict[str, Any]] = {}
         self._history_max_episodes: int = 100
-        self._plans_by_episode: Dict[int, List[Dict[str, Any]]] = {}
-        self._current_episode: int = 0
 
     def add_log(self, level: str, source: str, message: str) -> None:
         self._log_seq += 1
@@ -325,12 +304,6 @@ class BridgeServer:
             if isinstance(message, dict):
                 message = json.dumps(message, default=str)
             self.add_log(level, source, message)
-            if "得分:" in str(message):
-                try:
-                    score_str = str(message).split("得分:")[1].strip().split()[0]
-                    self._last_score = float(score_str)
-                except (ValueError, IndexError):
-                    pass
 
         result = []
         for entry in self._log_buffer:
@@ -771,10 +744,8 @@ class BridgeServer:
             "plan_progress": "0/0",
         }
         self._last_obs_state = None
-        self._episode_buffer = []
         self._current_plans = []
         self._prev_end_game_flag = False
-        self._last_score = 0.0
         self.add_log(
             "success", "autopilot", f"自动决策已启动 (mode={self._autopilot_mode})"
         )
@@ -784,8 +755,6 @@ class BridgeServer:
         self._action_plan = []
         self._planned_states = []
         self._plan_idx = 0
-        if self._episode_buffer:
-            self._commit_buffer(result="Interrupted")
         self.add_log("info", "autopilot", "自动决策已停止")
 
     def run_rollout_sync(
@@ -861,58 +830,6 @@ class BridgeServer:
             "full_nodes": nodes,
         }
 
-    def _commit_buffer(self, result: str = "", score: float = 0.0) -> None:
-        if not self._episode_buffer:
-            return
-        self._episode_counter += 1
-        ep = EpisodeRecord(
-            id=self._episode_counter,
-            result=result,
-            score=score,
-            markov_flow=[(e["state_id"], e["action"]) for e in self._episode_buffer],
-            events=[
-                {
-                    "state_id": e["state_id"],
-                    "action": e["action"],
-                    "event_type": e["event_type"],
-                    "mode": e["mode"],
-                    "match_mode": e["match_mode"],
-                    "plan_id": e["plan_id"],
-                }
-                for e in self._episode_buffer
-            ],
-            plans=[],
-            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            mode=self._autopilot_mode,
-            steps=len(self._episode_buffer),
-            match_mode=self._autopilot_params.get("match_mode", ""),
-        )
-        self._episodes.append(ep)
-        if len(self._episodes) > 50:
-            self._episodes = self._episodes[-50:]
-        self._episode_buffer = []
-        self._prev_end_game_flag = False
-        self.add_log("info", "episode", f"回合结束: {result}, 得分: {ep.score}")
-
-    def _detect_episode_end(
-        self, events: List[Dict[str, Any]]
-    ) -> Optional[Dict[str, Any]]:
-        for evt in events:
-            evt_type = evt.get("type", "")
-            if evt_type == "episode_end":
-                return evt
-            message = evt.get("message", "")
-            if isinstance(message, dict):
-                message = json.dumps(message, default=str)
-            if "得分:" in str(message):
-                try:
-                    score_str = str(message).split("得分:")[1].strip().split()[0]
-                    score = float(score_str)
-                    return {"type": "score_detected", "score": score}
-                except (ValueError, IndexError):
-                    pass
-        return None
-
     def _drain_history(self) -> None:
         for ep_data in self.bridge.get_histories():
             ep_id = ep_data["episode_id"]
@@ -975,18 +892,6 @@ async def _autopilot_loop():
                     if isinstance(message, dict):
                         message = json.dumps(message, default=str)
                     inst.add_log(level, source, message)
-                end_info = inst._detect_episode_end(raw_events)
-                if end_info is not None:
-                    if end_info.get("type") == "score_detected":
-                        score = end_info.get("score", 0.0)
-                        inst._last_score = score
-                        if inst._episodes:
-                            inst._episodes[-1].score = score
-                    elif inst._episode_buffer:
-                        result = end_info.get("result", "Unknown")
-                        inst._commit_buffer(result=result)
-                    await asyncio.sleep(0.01)
-                    continue
 
             obs = inst.bridge.get_observation(timeout=0.5)
             if obs is None:
@@ -1000,8 +905,6 @@ async def _autopilot_loop():
 
             end_flag = obs.get("end_game_flag", False)
             if end_flag and not inst._prev_end_game_flag:
-                result = obs.get("end_game_state", "Unknown")
-                inst._commit_buffer(result=result)
                 inst._last_obs_state = None
                 inst._prev_end_game_flag = True
                 await asyncio.sleep(0.01)
@@ -1033,21 +936,8 @@ async def _autopilot_loop():
                 inst._autopilot_stats["last_action"] = action
                 inst._autopilot_stats["last_state"] = state_id
                 inst.add_log("info", "autopilot", f"S{state_id} → {action}")
-
-                plan_id = None
                 if plan_snap is not None:
                     inst._current_plans.append(plan_snap)
-                    plan_id = len(inst._current_plans) - 1
-                inst._episode_buffer.append(
-                    {
-                        "state_id": state_id,
-                        "action": action,
-                        "event_type": event_type,
-                        "mode": inst._autopilot_mode,
-                        "match_mode": inst._autopilot_params.get("match_mode", ""),
-                        "plan_id": plan_id,
-                    }
-                )
 
             await asyncio.sleep(0.01)
     except asyncio.CancelledError:
@@ -1055,9 +945,6 @@ async def _autopilot_loop():
     except Exception as e:
         inst.add_log("error", "autopilot", f"异常退出: {str(e)}")
         inst._autopilot_enabled = False
-    finally:
-        if inst._episode_buffer:
-            inst._commit_buffer(result="Interrupted")
 
 
 def create_app(bridge: GameBridge) -> FastAPI:
@@ -1216,22 +1103,6 @@ def create_app(bridge: GameBridge) -> FastAPI:
         search: Optional[str] = Query(None),
     ):
         all_eps = []
-        for ep in _instance._episodes:
-            all_eps.append(
-                {
-                    "id": ep.id,
-                    "result": ep.result,
-                    "score": ep.score,
-                    "markov_flow": ep.markov_flow,
-                    "events": ep.events,
-                    "plans": ep.plans,
-                    "timestamp": ep.timestamp,
-                    "mode": ep.mode,
-                    "steps": ep.steps,
-                    "match_mode": ep.match_mode,
-                    "source": "autopilot",
-                }
-            )
         for ep_id in sorted(_instance._history_store.keys()):
             frames = _instance._history_store[ep_id]
             meta = _instance._history_meta.get(ep_id, {})
@@ -1257,7 +1128,7 @@ def create_app(bridge: GameBridge) -> FastAPI:
                 )
             all_eps.append(
                 {
-                    "id": 10000 + ep_id,
+                    "id": ep_id,
                     "result": meta.get("result", "Unknown"),
                     "score": meta.get("score", 0.0),
                     "markov_flow": markov_flow,
@@ -1267,7 +1138,7 @@ def create_app(bridge: GameBridge) -> FastAPI:
                     "mode": meta.get("mode", ""),
                     "steps": len(frames),
                     "match_mode": "",
-                    "source": "agent_buffer",
+                    "source": "agent",
                 }
             )
         if search:
@@ -1301,20 +1172,15 @@ def create_app(bridge: GameBridge) -> FastAPI:
     async def ack_episodes(request: Request):
         body = await request.json()
         ids = body.get("ids", [])
-        agent_ids = [eid - 10000 for eid in ids if eid >= 10000]
-        if agent_ids:
-            _instance.ack_history(agent_ids)
-        return {"ok": True, "acked": len(agent_ids)}
+        if ids:
+            _instance.ack_history(ids)
+        return {"ok": True, "acked": len(ids)}
 
     @app.post("/game/episodes/clear")
     async def clear_episodes():
-        _instance._episodes.clear()
-        _instance._episode_buffer.clear()
-        _instance._episode_counter = 0
         _instance._current_plans.clear()
         _instance._history_store.clear()
         _instance._history_meta.clear()
-        _instance._plans_by_episode.clear()
         _instance.add_log("info", "system", "对局记录已清空")
         return {"ok": True}
 
@@ -1432,8 +1298,6 @@ def create_app(bridge: GameBridge) -> FastAPI:
 
     @app.post("/game/shutdown")
     async def shutdown():
-        if _instance._episode_buffer:
-            _instance._commit_buffer(result="Shutdown")
         _instance.bridge.request_stop()
         threading.Thread(target=lambda: os._exit(0), daemon=True).start()
         return {"status": "shutting_down"}
