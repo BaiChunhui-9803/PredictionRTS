@@ -61,14 +61,17 @@ def spawn_units(env, agent):
     env._controllers[0].debug(debug_commands)
 
 
-def _move_sc2_window(x=50, y=50, w=640, h=480):
+def _move_sc2_window(x=50, y=50, w=640, h=480, timeout=10):
     import ctypes
     import time
 
-    time.sleep(1.5)
-    hwnd = ctypes.windll.user32.FindWindowW(None, "StarCraft II")
-    if hwnd:
-        ctypes.windll.user32.SetWindowPos(hwnd, 0, x, y, w, h, 0x0040)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        hwnd = ctypes.windll.user32.FindWindowW(None, "StarCraft II")
+        if hwnd:
+            ctypes.windll.user32.SetWindowPos(hwnd, 0, x, y, w, h, 0x0040)
+            return
+        time.sleep(0.3)
 
 
 def run_loop_custom(
@@ -309,7 +312,7 @@ def run_loop_custom(
             bridge.update_status(running=False, mode="stopped")
     print(
         "Took %.3f seconds for %s steps: %.3f fps"
-        % (elapsed_time, total_frames, total_frames / elapsed_time)
+        % (elapsed_time, total_frames, total_frames / max(elapsed_time, 1e-6))
     )
 
 

@@ -1,4 +1,5 @@
 import sys
+import socket
 import subprocess
 import time
 import requests
@@ -10,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src import ROOT_DIR
 from kg_web.constants import BRIDGE_API_URL, _ACTION_STRATEGY_LABELS
+from kg_web.loaders import load_episode_data
 from kg_web.live_game_html import _build_live_game_html
 
 
@@ -92,118 +94,146 @@ def _render_live_game_sidebar(kg_entry: Optional[Dict] = None):
         help="开启后服务启动时自动进入暂停状态，需手动恢复",
     )
 
-    st.subheader("Beam Search 参数")
+    map_id = kg_entry.get("map_id", "") if kg_entry else ""
+    data_id = kg_entry.get("data_id", "") if kg_entry else ""
+    ep_data = None
+    if map_id and data_id:
+        ep_data = load_episode_data(map_id, data_id)
+    has_replay = ep_data is not None and ep_data["n_episodes"] > 0
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.selectbox(
-            "评分策略",
-            options=["quality", "future_reward", "win_rate"],
-            format_func={
-                "quality": "Quality Score",
-                "future_reward": "Future Reward",
-                "win_rate": "Win Rate",
-            }.get,
-            key="live_sm",
-        )
-    with c2:
-        st.slider("Beam Width", 1, 10, 3, key="live_bw")
-
-    c3, c4 = st.columns(2)
-    with c3:
-        st.slider("前瞻步数", 1, 15, 5, key="live_la")
-    with c4:
-        st.slider("最低访问次数", 1, 10, 1, key="live_mv")
-
-    c5, c6 = st.columns(2)
-    with c5:
-        st.slider(
-            "最大状态重复",
-            1,
-            5,
-            2,
-            key="live_msr",
-            help="同一条推演路径中同一状态最多出现的次数。",
-        )
-    with c6:
-        st.slider(
-            "累积概率阈值",
-            0.001,
-            0.1,
-            0.01,
-            step=0.001,
-            format="%.3f",
-            key="live_mcp",
-        )
-
-    c7, c8 = st.columns(2)
-    with c7:
-        st.slider(
-            "折扣因子",
-            0.5,
-            1.0,
-            0.9,
-            step=0.05,
-            format="%.2f",
-            key="live_df",
-            help="每步累积概率乘以此值的步数次幂。1.0=无折扣。",
-        )
-    with c8:
-        st.selectbox(
-            "动作选择",
-            options=list(_ACTION_STRATEGY_LABELS.keys()),
-            format_func=lambda x: _ACTION_STRATEGY_LABELS[x],
-            key="live_as",
-        )
-
-    c9, c10 = st.columns(2)
-    with c9:
-        st.slider(
-            "ε",
-            0.01,
-            0.5,
-            0.1,
-            step=0.01,
-            format="%.2f",
-            key="live_eps",
-            disabled=(st.session_state.get("live_as") != "epsilon_greedy"),
-        )
-    with c10:
-        st.slider("最大推演步数", 1, 100, 50, key="live_mrs")
-
+    mode_options = ["单步推演", "多步推演"]
+    if has_replay:
+        mode_options.append("回放重演")
     st.markdown("**推演模式**")
     live_mode = st.radio(
         "mode",
-        options=["单步推演", "多步推演"],
+        options=mode_options,
         index=0,
         horizontal=True,
         key="live_mode",
         label_visibility="collapsed",
     )
 
-    live_backup = st.toggle("启用备选路径", value=False, key="live_backup")
-    if live_backup:
-        bc1, bc2 = st.columns(2)
-        with bc1:
+    if live_mode == "回放重演" and has_replay:
+        ep_outcomes = ep_data["outcomes"]
+        ep_actions = ep_data["actions"]
+        n_ep = ep_data["n_episodes"]
+        replay_options = [
+            f"Episode {i} ({ep_outcomes[i] if i < len(ep_outcomes) else '?'}, {len(ep_actions[i]) if i < len(ep_actions) else 0}步)"
+            for i in range(n_ep)
+        ]
+        replay_idx = st.selectbox(
+            "选择 Episode",
+            options=range(n_ep),
+            format_func=lambda i: replay_options[i],
+            key="live_replay_ep",
+        )
+        replay_runs = st.slider("执行次数", 1, 50, 1, key="live_replay_runs")
+
+    live_backup = False
+    if live_mode != "回放重演":
+        st.subheader("Beam Search 参数")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.selectbox(
+                "评分策略",
+                options=["quality", "future_reward", "win_rate"],
+                format_func={
+                    "quality": "Quality Score",
+                    "future_reward": "Future Reward",
+                    "win_rate": "Win Rate",
+                }.get,
+                key="live_sm",
+            )
+        with c2:
+            st.slider("Beam Width", 1, 10, 3, key="live_bw")
+
+        c3, c4 = st.columns(2)
+        with c3:
+            st.slider("前瞻步数", 1, 15, 5, key="live_la")
+        with c4:
+            st.slider("最低访问次数", 1, 10, 1, key="live_mv")
+
+        c5, c6 = st.columns(2)
+        with c5:
             st.slider(
-                "备选评分阈值",
-                0.0,
+                "最大状态重复",
+                1,
+                5,
+                2,
+                key="live_msr",
+                help="同一条推演路径中同一状态最多出现的次数。",
+            )
+        with c6:
+            st.slider(
+                "累积概率阈值",
+                0.001,
+                0.1,
+                0.01,
+                step=0.001,
+                format="%.3f",
+                key="live_mcp",
+            )
+
+        c7, c8 = st.columns(2)
+        with c7:
+            st.slider(
+                "折扣因子",
+                0.5,
                 1.0,
-                0.3,
+                0.9,
                 step=0.05,
                 format="%.2f",
-                key="live_backup_st",
+                key="live_df",
+                help="每步累积概率乘以此值的步数次幂。1.0=无折扣。",
             )
-        with bc2:
+        with c8:
+            st.selectbox(
+                "动作选择",
+                options=list(_ACTION_STRATEGY_LABELS.keys()),
+                format_func=lambda x: _ACTION_STRATEGY_LABELS[x],
+                key="live_as",
+            )
+
+        c9, c10 = st.columns(2)
+        with c9:
             st.slider(
-                "模糊匹配距离阈值",
-                0.0,
-                1.0,
-                0.2,
-                step=0.05,
+                "ε",
+                0.01,
+                0.5,
+                0.1,
+                step=0.01,
                 format="%.2f",
-                key="live_backup_dt",
+                key="live_eps",
+                disabled=(st.session_state.get("live_as") != "epsilon_greedy"),
             )
+        with c10:
+            st.slider("最大推演步数", 1, 100, 50, key="live_mrs")
+
+        live_backup = st.toggle("启用备选路径", value=False, key="live_backup")
+        if live_backup:
+            bc1, bc2 = st.columns(2)
+            with bc1:
+                st.slider(
+                    "备选评分阈值",
+                    0.0,
+                    1.0,
+                    0.3,
+                    step=0.05,
+                    format="%.2f",
+                    key="live_backup_st",
+                )
+            with bc2:
+                st.slider(
+                    "模糊匹配距离阈值",
+                    0.0,
+                    1.0,
+                    0.2,
+                    step=0.05,
+                    format="%.2f",
+                    key="live_backup_dt",
+                )
 
     if _start_clicked:
         if "live_proc" in st.session_state and st.session_state.live_proc is not None:
@@ -255,32 +285,44 @@ def _render_live_game_sidebar(kg_entry: Optional[Dict] = None):
             "max_state_revisits": st.session_state.get("live_msr", 2),
             "discount_factor": st.session_state.get("live_df", 0.9),
         }
-        _ap_payload = {
-            "enabled": True,
-            "mode": "single_step" if live_mode == "单步推演" else "multi_step",
-            "lookahead_steps": st.session_state.get("live_la", 5),
-            "action_strategy": st.session_state.get("live_as", "best_beam"),
-            "score_mode": st.session_state.get("live_sm", "quality"),
-            "beam_width": st.session_state.get("live_bw", 3),
-            "max_steps": st.session_state.get("live_mrs", 50),
-            "min_visits": st.session_state.get("live_mv", 1),
-            "min_cum_prob": st.session_state.get("live_mcp", 0.01),
-            "max_state_revisits": st.session_state.get("live_msr", 2),
-            "discount_factor": st.session_state.get("live_df", 0.9),
-            "enable_backup": live_backup,
-            "epsilon": st.session_state.get("live_eps", 0.1),
-        }
+        _ap_payload = {"enabled": True}
+        if live_mode == "回放重演":
+            _ap_payload["mode"] = "replay"
+            _ap_payload["replay_actions"] = (
+                ep_data["actions"][replay_idx]
+                if replay_idx < len(ep_data["actions"])
+                else []
+            )
+            _ap_payload["replay_runs"] = replay_runs
+        else:
+            _ap_payload["mode"] = (
+                "single_step" if live_mode == "单步推演" else "multi_step"
+            )
+            _ap_payload["lookahead_steps"] = st.session_state.get("live_la", 5)
+            _ap_payload["action_strategy"] = st.session_state.get(
+                "live_as", "best_beam"
+            )
+            _ap_payload["score_mode"] = st.session_state.get("live_sm", "quality")
+            _ap_payload["beam_width"] = st.session_state.get("live_bw", 3)
+            _ap_payload["max_steps"] = st.session_state.get("live_mrs", 50)
+            _ap_payload["min_visits"] = st.session_state.get("live_mv", 1)
+            _ap_payload["min_cum_prob"] = st.session_state.get("live_mcp", 0.01)
+            _ap_payload["max_state_revisits"] = st.session_state.get("live_msr", 2)
+            _ap_payload["discount_factor"] = st.session_state.get("live_df", 0.9)
+            _ap_payload["enable_backup"] = live_backup
+            _ap_payload["epsilon"] = st.session_state.get("live_eps", 0.1)
         with st.spinner("等待服务启动..."):
             for _ in range(30):
                 time.sleep(0.5)
                 try:
                     r = requests.get(f"{api_base}/game/status", timeout=2)
                     if r.status_code == 200:
-                        requests.post(
-                            f"{api_base}/game/beam_params",
-                            json=_beam_params,
-                            timeout=5,
-                        )
+                        if live_mode != "回放重演":
+                            requests.post(
+                                f"{api_base}/game/beam_params",
+                                json=_beam_params,
+                                timeout=5,
+                            )
                         requests.post(
                             f"{api_base}/game/autopilot",
                             json=_ap_payload,
@@ -321,7 +363,27 @@ def _render_live_game_sidebar(kg_entry: Optional[Dict] = None):
         pass
 
 
+def _get_bridge_host():
+    if "_bridge_host" not in st.session_state:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            st.session_state["_bridge_host"] = s.getsockname()[0]
+            s.close()
+        except Exception:
+            st.session_state["_bridge_host"] = "localhost"
+    return st.session_state["_bridge_host"]
+
+
 def _render_live_game_content():
     port = int(st.session_state.get("live_port", 8000))
-    html = _build_live_game_html(port)
-    st.components.v1.html(html, height=950, scrolling=False)
+    host = _get_bridge_host()
+    html = _build_live_game_html(port, host)
+    st.markdown(
+        """<style>
+.stMainBlockContainer{padding-bottom:1rem !important}
+div[data-testid="stVerticalBlock"]>div:has(>div:has(iframe)){margin-bottom:0 !important;padding-bottom:0 !important}
+</style>""",
+        unsafe_allow_html=True,
+    )
+    st.components.v1.html(html, height=1250, scrolling=True)

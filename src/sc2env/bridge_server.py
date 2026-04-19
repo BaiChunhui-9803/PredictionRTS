@@ -120,6 +120,8 @@ class AutopilotRequest(BaseModel):
     discount_factor: float = 0.9
     enable_backup: bool = False
     epsilon: float = 0.1
+    replay_actions: List[str] = []
+    replay_runs: int = 1
 
 
 class ActionRequest(BaseModel):
@@ -153,6 +155,9 @@ class LogEntry:
         }
 
 
+_cluster_to_nid_cache: Dict[Tuple[int, int], Optional[int]] = {}
+
+
 def _parse_state_id(obs: Dict[str, Any]) -> Optional[int]:
     state_cluster = obs.get("state_cluster_str", "0")
     try:
@@ -164,6 +169,11 @@ def _parse_state_id(obs: Dict[str, Any]) -> Optional[int]:
                 nid = _instance._state_id_map.get(key)
                 if nid is not None:
                     return nid
+                cached = _cluster_to_nid_cache.get(key)
+                if cached is not None:
+                    return cached
+                if key in _cluster_to_nid_cache:
+                    return None
                 norm_state = obs.get("norm_state")
                 if norm_state and _instance._nid_norm_states:
                     from src.structure.custom_distance_sc2 import DistributionDistance
@@ -182,17 +192,9 @@ def _parse_state_id(obs: Dict[str, Any]) -> Optional[int]:
                         except Exception:
                             pass
                     if best_nid is not None:
-                        _instance.add_log(
-                            "warn",
-                            "state_mapping",
-                            f"({key[0]},{key[1]})→S{best_nid} dist={best_dist:.3f} hp={best_hp:.3f}",
-                        )
+                        _cluster_to_nid_cache[key] = best_nid
                         return best_nid
-                _instance.add_log(
-                    "error",
-                    "state_mapping",
-                    f"({key[0]},{key[1]}) 无映射, 跳过该帧",
-                )
+                _cluster_to_nid_cache[key] = None
                 return None
             return int(state_cluster[0])
         elif isinstance(state_cluster, (list, tuple)) and len(state_cluster) == 1:
@@ -232,6 +234,268 @@ def _states_match(
         except (IndexError, TypeError, KeyError):
             pass
     return False
+
+
+def _safe_dist(dm, shape, a: int, b: int) -> Optional[float]:
+    if dm is None or not isinstance(a, int) or not isinstance(b, int):
+        return None
+    try:
+        if 0 <= a < shape[0] and 0 <= b < shape[1]:
+            d = float(dm[a, b])
+            return None if np.isnan(d) else d
+    except (IndexError, TypeError):
+        pass
+    return None
+
+
+def _compute_deviations(events: List[Dict]) -> List[Dict]:
+    dm = _instance._dist_matrix if _instance else None
+    dm_shape = dm.shape if dm is not None else (0, 0)
+    plan_id_counter = 0
+    current_planned_states: List[int] = []
+    plan_step_idx = 0
+    current_plan_start_idx = 0
+    is_multi = False
+    for i, ev in enumerate(events):
+        plan = ev.get("plan")
+        et = ev.get("event_type", "")
+        actual_state = ev.get("state_id")
+        if not isinstance(actual_state, int):
+            try:
+                actual_state = int(actual_state)
+            except (TypeError, ValueError):
+                actual_state = None
+        deviation = None
+        planned_state = None
+        prev_prediction_error = None
+        if plan is not None:
+            planned_states = plan.get("planned_states") or plan.get("action_plan", [])
+            planned_states = [
+                s for s in planned_states if isinstance(s, (int, float, np.integer))
+            ]
+            if planned_states:
+                is_multi = plan.get("mode") == "multi_step"
+                current_planned_states = [int(s) for s in planned_states]
+                plan_step_idx = 0
+                plan_id_counter += 1
+                current_plan_start_idx = i
+                if (
+                    is_multi
+                    and len(current_planned_states) > 1
+                    and actual_state is not None
+                ):
+                    planned_state = current_planned_states[0]
+                    deviation = _safe_dist(dm, dm_shape, actual_state, planned_state)
+            else:
+                current_planned_states = []
+                plan_step_idx = 0
+                plan_id_counter += 1
+                current_plan_start_idx = i
+        if et == "kg_follow" and current_planned_states:
+            idx_in_plan = plan_step_idx
+            if idx_in_plan < len(current_planned_states) and actual_state is not None:
+                planned_state = current_planned_states[idx_in_plan]
+                deviation = _safe_dist(dm, dm_shape, actual_state, planned_state)
+            plan_step_idx += 1
+        elif et == "kg_plan" and plan is None and current_planned_states:
+            plan_step_idx += 1
+        if i > 0 and actual_state is not None and prev_prediction_error is None:
+            prev_ev = events[i - 1]
+            prev_plan = prev_ev.get("plan")
+            if prev_plan is not None:
+                beam_paths = prev_plan.get("beam_paths")
+                if beam_paths and len(beam_paths) > 0:
+                    chosen = beam_paths[0]
+                    steps = chosen.get("steps", [])
+                    for step in steps[1:]:
+                        if isinstance(step.get("state"), (int, float, np.integer)):
+                            predicted = int(step["state"])
+                            prev_prediction_error = _safe_dist(
+                                dm, dm_shape, actual_state, predicted
+                            )
+                            break
+        ev["deviation"] = float(deviation) if deviation is not None else None
+        ev["planned_state"] = planned_state
+        ev["plan_id"] = (
+            plan_id_counter
+            if plan is not None or current_planned_states
+            else (plan_id_counter if et == "kg_follow" else 0)
+        )
+        ev["plan_step_idx"] = (
+            plan_step_idx if (plan is not None or et == "kg_follow") else 0
+        )
+        ev["prediction_error"] = (
+            float(prev_prediction_error) if prev_prediction_error is not None else None
+        )
+    return events
+
+
+def _lookup_dist_map(dist_map: Dict, a, b) -> Optional[float]:
+    if not dist_map or a is None or b is None:
+        return None
+    k1 = f"{a},{b}"
+    k2 = f"{b},{a}"
+    if k1 in dist_map:
+        return dist_map[k1]
+    if k2 in dist_map:
+        return dist_map[k2]
+    return None
+
+
+def _build_fork_tree_data(events: List[Dict], dist_map: Dict) -> Optional[Dict]:
+    from sklearn.manifold import MDS as _MDS
+
+    n = min(len(events), 40)
+    nodes = {}
+    edges = []
+    edge_set = set()
+
+    for i in range(n):
+        ev = events[i]
+        sid = ev.get("state_id")
+        if not isinstance(sid, int):
+            try:
+                sid = int(sid)
+            except (TypeError, ValueError):
+                sid = None
+        nid = f"A{i}"
+        nodes[nid] = {
+            "id": nid,
+            "state": sid,
+            "label": f"S{sid}" if sid is not None else "S?",
+            "type": "actual",
+            "frame": i,
+            "et": ev.get("event_type", "no_action"),
+            "planId": ev.get("plan_id", 0),
+        }
+        if i > 0:
+            prev_sid = events[i - 1].get("state_id")
+            if not isinstance(prev_sid, int):
+                try:
+                    prev_sid = int(prev_sid)
+                except (TypeError, ValueError):
+                    prev_sid = None
+            d = _lookup_dist_map(dist_map, prev_sid, sid)
+            ek = f"A{i - 1}->{nid}"
+            if ek not in edge_set:
+                edge_set.add(ek)
+                edges.append(
+                    {
+                        "from": f"A{i - 1}",
+                        "to": nid,
+                        "type": "actual",
+                        "et": ev.get("event_type", "no_action"),
+                        "dist": d,
+                    }
+                )
+
+        plan = ev.get("plan")
+        if not plan or not plan.get("beam_paths"):
+            continue
+        bp_list = plan["beam_paths"]
+        for pi, bp in enumerate(bp_list):
+            steps = bp.get("steps", [])
+            if not steps or len(steps) < 2:
+                continue
+            is_chosen = bool(bp.get("chosen", False))
+            parent_id = f"A{i}"
+            parent_state = sid
+            for si in range(1, len(steps)):
+                step = steps[si]
+                step_state = step.get("state")
+                if step_state is None:
+                    continue
+                try:
+                    step_state = int(step_state)
+                except (TypeError, ValueError):
+                    continue
+                beam_nid = f"P{i}_{si}_{step_state}"
+                if beam_nid not in nodes:
+                    nodes[beam_nid] = {
+                        "id": beam_nid,
+                        "state": step_state,
+                        "label": f"S{step_state}",
+                        "type": "beam",
+                        "frame": i,
+                        "stepIdx": si,
+                    }
+                nd = nodes[beam_nid]
+                if "pathIndices" not in nd:
+                    nd["pathIndices"] = []
+                if pi not in nd["pathIndices"]:
+                    nd["pathIndices"].append(pi)
+                if is_chosen:
+                    nd["chosen"] = True
+                d = _lookup_dist_map(dist_map, parent_state, step_state)
+                ek = f"{parent_id}->{beam_nid}"
+                if ek not in edge_set:
+                    edge_set.add(ek)
+                    edges.append(
+                        {
+                            "from": parent_id,
+                            "to": beam_nid,
+                            "type": "beam",
+                            "dist": d,
+                            "chosen": is_chosen,
+                            "pathIdx": pi,
+                        }
+                    )
+                parent_id = beam_nid
+                parent_state = step_state
+
+    if len(nodes) < 2:
+        return None
+
+    ids = sorted(nodes.keys())
+    N = len(ids)
+    idx_map = {nid: idx for idx, nid in enumerate(ids)}
+    D = np.full((N, N), 1.0)
+    for i in range(N):
+        D[i, i] = 0.0
+    for i in range(N):
+        for j in range(i + 1, N):
+            s1 = nodes[ids[i]].get("state")
+            s2 = nodes[ids[j]].get("state")
+            d = _lookup_dist_map(dist_map, s1, s2)
+            if d is not None:
+                v = max(d, 0.001)
+            else:
+                v = 1.0
+            D[i, j] = v
+            D[j, i] = v
+
+    try:
+        mds = _MDS(
+            n_components=2,
+            dissimilarity="precomputed",
+            random_state=42,
+            normalized_stress=False,
+            max_iter=300,
+        )
+        coords_2d = mds.fit_transform(D)
+    except Exception:
+        return {"nodes": list(nodes.values()), "edges": edges, "coords": {}}
+
+    mins = coords_2d.min(axis=0)
+    maxs = coords_2d.max(axis=0)
+    ranges = maxs - mins
+    ranges[ranges == 0] = 1.0
+    coords_2d = (coords_2d - mins) / ranges
+
+    pad_l, pad_t = 60, 50
+    draw_w, draw_h = 900, 450
+    result_coords = {}
+    for i, nid in enumerate(ids):
+        result_coords[nid] = [
+            round(pad_l + float(coords_2d[i, 0]) * draw_w, 1),
+            round(pad_t + float(coords_2d[i, 1]) * draw_h, 1),
+        ]
+
+    return {
+        "nodes": list(nodes.values()),
+        "edges": edges,
+        "coords": result_coords,
+    }
 
 
 class BridgeServer:
@@ -280,14 +544,16 @@ class BridgeServer:
         }
         self._dist_matrix: Optional[np.ndarray] = None
         self._last_obs_state: Optional[int] = None
+        self._last_obs_game_loop: int = 0
+        self._last_plan_snap: Optional[Dict[str, Any]] = None
         self._nid_norm_states: Dict[int, dict] = {}
 
-        self._current_plans: List[Dict[str, Any]] = []
         self._prev_end_game_flag: bool = False
 
         self._history_store: Dict[int, List[Dict[str, Any]]] = {}
         self._history_meta: Dict[int, Dict[str, Any]] = {}
         self._history_max_episodes: int = 100
+        self._ep_detail_cache: Dict[int, Dict[str, Any]] = {}
 
     def add_log(self, level: str, source: str, message: str) -> None:
         self._log_seq += 1
@@ -380,6 +646,7 @@ class BridgeServer:
             self.transitions = {}
 
         self._dist_matrix = None
+        map_id, data_id = "", ""
         if data_dir:
             dp = Path(data_dir)
             parts = dp.parts
@@ -427,6 +694,62 @@ class BridgeServer:
         self._nid_norm_states = {}
         if data_dir and self._state_id_map:
             self._load_known_states(data_dir)
+
+        self._mds_coords = None
+        if self._dist_matrix is not None and map_id and data_id:
+            try:
+                npy_dir = ROOT_DIR / "cache" / "npy"
+                npy_dir.mkdir(parents=True, exist_ok=True)
+                mds_path = npy_dir / f"state_mds_coords_{map_id}_{data_id}.npy"
+                if mds_path.exists():
+                    self._mds_coords = np.load(str(mds_path))
+                    logger.info(
+                        f"Loaded MDS coords from {mds_path} ({self._mds_coords.shape})"
+                    )
+                else:
+                    dm = self._dist_matrix.copy()
+                    nan_mask = np.isnan(dm)
+                    if nan_mask.any():
+                        valid_max = np.nanmax(dm)
+                        dm[nan_mask] = valid_max * 1.5 if valid_max > 0 else 1.0
+                    np.fill_diagonal(dm, 0)
+                    dm = (dm + dm.T) / 2.0
+                    N = dm.shape[0]
+                    if N <= 2000:
+                        from sklearn.manifold import MDS as _MDS
+
+                        emb = _MDS(
+                            n_components=2,
+                            dissimilarity="precomputed",
+                            random_state=42,
+                            max_iter=300,
+                            normalized_stress=False,
+                        )
+                        coords = emb.fit_transform(dm)
+                    else:
+                        from sklearn.manifold import SpectralEmbedding as _SE
+
+                        med = np.median(dm[dm > 0])
+                        if med <= 0:
+                            med = 1.0
+                        affinity = np.exp(-(dm**2) / (med**2))
+                        np.fill_diagonal(affinity, 1.0)
+                        emb = _SE(
+                            n_components=2, affinity="precomputed", random_state=42
+                        )
+                        coords = emb.fit_transform(affinity)
+                    mins = coords.min(axis=0)
+                    maxs = coords.max(axis=0)
+                    ranges = maxs - mins
+                    ranges[ranges == 0] = 1.0
+                    coords = (coords - mins) / ranges
+                    np.save(str(mds_path), coords)
+                    self._mds_coords = coords
+                    logger.info(
+                        f"Computed & saved MDS coords ({N} states) to {mds_path}"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to compute MDS coords: {e}")
 
         self.kg_loaded = True
         return True
@@ -612,12 +935,81 @@ class BridgeServer:
         except Exception:
             return None
 
+    def _try_backup_switch(
+        self, actual_state: int, plan_position: int
+    ) -> Optional[Tuple[str, str, Dict]]:
+        snap = self._last_plan_snap
+        if not snap:
+            return None
+        sp_map = snap.get("switch_points_by_segment")
+        if not sp_map:
+            return None
+        points = sp_map.get(str(plan_position), [])
+        if not points:
+            return None
+        for sp in points:
+            if sp["predicted_state"] == actual_state:
+                result = self._apply_backup(sp, "backup_switch_exact", actual_state)
+                if result:
+                    return result
+        if self._dist_matrix is not None:
+            best = None
+            best_dist = 0.2
+            for sp in points:
+                try:
+                    d = float(self._dist_matrix[actual_state, sp["predicted_state"]])
+                    if np.isnan(d):
+                        continue
+                    if d < best_dist:
+                        best_dist = d
+                        best = sp
+                except (IndexError, TypeError):
+                    continue
+            if best is not None:
+                result = self._apply_backup(best, "backup_switch_fuzzy", actual_state)
+                if result:
+                    return result
+        return None
+
+    def _apply_backup(
+        self, sp: Dict, event_type: str, actual_state: int
+    ) -> Optional[Tuple[str, str, Dict]]:
+        remaining = sp.get("remaining_actions", [])
+        if not remaining:
+            return None
+        action = remaining[0]
+        new_actions = list(remaining)
+        new_plan_snap = {
+            "state_id": actual_state,
+            "action_plan": new_actions,
+            "planned_states": [actual_state],
+            "mode": "multi_step",
+            "trigger": "backup_switch",
+            "backup_match_type": sp.get("match_type", "unknown"),
+        }
+        self._action_plan = new_actions
+        self._planned_states = [actual_state]
+        self._plan_idx = 1
+        self._autopilot_stats["total_decisions"] += 1
+        self._autopilot_stats["total_backup_switches"] = (
+            self._autopilot_stats.get("total_backup_switches", 0) + 1
+        )
+        self._autopilot_stats["plan_progress"] = f"1/{len(new_actions)}"
+        self.add_log(
+            "info",
+            "autopilot",
+            f"备选切换({sp.get('match_type', '?')}): S{actual_state} → {action}",
+        )
+        return action, event_type, new_plan_snap
+
     def _autopilot_decide(
         self, state_id: int
     ) -> Tuple[Optional[str], str, Optional[Dict]]:
         if not self.kg_loaded or self.kg is None:
             self.add_log("warn", "autopilot", "KG 未加载，跳过决策")
             return None, "no_action", None
+
+        mode = self._autopilot_mode
 
         mode = self._autopilot_mode
         params = self._autopilot_params
@@ -651,6 +1043,8 @@ class BridgeServer:
                 if action
                 else None
             )
+            if action:
+                self._last_plan_snap = plan_snap
             return action, "kg_plan" if action else "no_action", plan_snap
 
         else:
@@ -664,6 +1058,10 @@ class BridgeServer:
                 if expected is not None and not _states_match(
                     state_id, expected, self._dist_matrix, 0.2
                 ):
+                    bs_result = self._try_backup_switch(state_id, self._plan_idx)
+                    if bs_result is not None:
+                        self._last_plan_snap = bs_result[2]
+                        return bs_result
                     self._autopilot_stats["total_divergences"] += 1
                     self.add_log(
                         "warn",
@@ -696,6 +1094,7 @@ class BridgeServer:
                         "mode": "multi_step",
                         "trigger": "diverge" if is_diverge else "exhausted",
                     }
+                    self._last_plan_snap = plan_snap
                     self.add_log(
                         "info",
                         "autopilot",
@@ -707,7 +1106,10 @@ class BridgeServer:
                     return None, "fallback", None
 
             action = self._action_plan[self._plan_idx]
-            event_type = "kg_plan" if self._plan_idx == 0 else "kg_follow"
+            if self._plan_idx == 0:
+                event_type = "diverge" if is_diverge else "kg_plan"
+            else:
+                event_type = "kg_follow"
             self._plan_idx += 1
             self._autopilot_stats["total_decisions"] += 1
             self._autopilot_stats["plan_progress"] = (
@@ -716,7 +1118,7 @@ class BridgeServer:
             return action, event_type, plan_snap
 
     def get_autopilot_status(self) -> Dict[str, Any]:
-        return {
+        result = {
             "enabled": self._autopilot_enabled,
             "mode": self._autopilot_mode,
             "plan_progress": self._autopilot_stats["plan_progress"],
@@ -727,6 +1129,11 @@ class BridgeServer:
             ),
             "stats": dict(self._autopilot_stats),
         }
+        if self._autopilot_mode == "replay":
+            result["replay"] = {
+                "queue_remaining": self.bridge.replay_queue.qsize(),
+            }
+        return result
 
     def start_autopilot(self, params: Dict[str, Any]) -> None:
         self._autopilot_params = params
@@ -744,7 +1151,17 @@ class BridgeServer:
             "plan_progress": "0/0",
         }
         self._last_obs_state = None
-        self._current_plans = []
+        self._last_obs_game_loop = 0
+        if self._autopilot_mode == "replay":
+            actions = params.get("replay_actions", [])
+            runs = max(1, params.get("replay_runs", 1))
+            self.bridge.load_replay_actions(actions, runs)
+            self.add_log(
+                "info",
+                "replay",
+                f"回放模式: {len(actions)}步 × {runs}轮, 已加载到动作队列",
+            )
+        self._last_plan_snap = None
         self._prev_end_game_flag = False
         self.add_log(
             "success", "autopilot", f"自动决策已启动 (mode={self._autopilot_mode})"
@@ -840,14 +1257,14 @@ class BridgeServer:
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "mode": self._autopilot_mode,
                 "frame_count": len(ep_data["frames"]),
-                "plans": list(self._current_plans),
             }
-            self._current_plans = []
+            self._ep_detail_cache.pop(ep_id, None)
         while len(self._history_store) > self._history_max_episodes:
             oldest = min(self._history_store.keys())
             del self._history_store[oldest]
             if oldest in self._history_meta:
                 del self._history_meta[oldest]
+            self._ep_detail_cache.pop(oldest, None)
 
     def history_stats(self) -> Dict[str, int]:
         total_frames = sum(len(f) for f in self._history_store.values())
@@ -861,6 +1278,90 @@ class BridgeServer:
         for eid in episode_ids:
             self._history_store.pop(eid, None)
             self._history_meta.pop(eid, None)
+            self._ep_detail_cache.pop(eid, None)
+
+    def _build_episode_detail(self, ep_id: int) -> Optional[Dict[str, Any]]:
+        cached = self._ep_detail_cache.get(ep_id)
+        if cached is not None:
+            return cached
+
+        frames = self._history_store.get(ep_id)
+        if frames is None:
+            return None
+        meta = self._history_meta.get(ep_id, {})
+
+        markov_flow = []
+        events_list = []
+        for fr in frames:
+            nid = fr.get("nid")
+            if nid is None:
+                nid = fr.get("state_cluster", (0, 0))
+            markov_flow.append([nid, fr.get("action_code", fr.get("action", ""))])
+            events_list.append(
+                {
+                    "state_id": nid,
+                    "state_cluster": fr.get("state_cluster"),
+                    "action": fr.get("action", ""),
+                    "action_code": fr.get("action_code", ""),
+                    "event_type": fr.get("action_source", ""),
+                    "my_count": fr.get("my_count", 0),
+                    "enemy_count": fr.get("enemy_count", 0),
+                    "hp_my": fr.get("hp_my", 0),
+                    "hp_enemy": fr.get("hp_enemy", 0),
+                    "game_loop": fr.get("game_loop", 0),
+                    "end_game_flag": fr.get("end_game_flag", False),
+                    "my_units_pos": self._to_native(fr.get("my_units_pos", [])),
+                    "enemy_units_pos": self._to_native(fr.get("enemy_units_pos", [])),
+                    "plan": self._to_native(fr.get("plan"))
+                    if fr.get("plan") is not None
+                    else None,
+                }
+            )
+        events_list = _compute_deviations(events_list)
+        _all_st = set()
+        for _ev in events_list:
+            _sid = _ev.get("state_id")
+            if isinstance(_sid, int):
+                _all_st.add(_sid)
+            _ps = _ev.get("planned_state")
+            if isinstance(_ps, int):
+                _all_st.add(_ps)
+            _pl = _ev.get("plan")
+            if _pl and _pl.get("beam_paths"):
+                for _bp in _pl["beam_paths"]:
+                    for _st in _bp.get("steps", []):
+                        _sv = _st.get("state")
+                        if _sv is not None:
+                            try:
+                                _all_st.add(int(_sv))
+                            except (TypeError, ValueError):
+                                pass
+        _dm_local = self._dist_matrix if self else None
+        _dm_sh = _dm_local.shape if _dm_local is not None else (0, 0)
+        _dist_map = {}
+        for _s1 in _all_st:
+            for _s2 in _all_st:
+                if _s1 <= _s2:
+                    _d = _safe_dist(_dm_local, _dm_sh, _s1, _s2)
+                    if _d is not None:
+                        _dist_map[f"{_s1},{_s2}"] = round(_d, 4)
+
+        result = {
+            "id": ep_id,
+            "result": meta.get("result", "Unknown"),
+            "score": meta.get("score", 0.0),
+            "markov_flow": markov_flow,
+            "events": events_list,
+            "timestamp": meta.get("timestamp", ""),
+            "mode": meta.get("mode", ""),
+            "steps": len(frames),
+            "match_mode": "",
+            "source": "agent",
+            "dist_map": _dist_map,
+            "fork_tree": _build_fork_tree_data(events_list, _dist_map),
+        }
+        self._ep_detail_cache[ep_id] = result
+        return result
 
     def event_generator(self):
         try:
@@ -905,6 +1406,13 @@ async def _autopilot_loop():
 
             end_flag = obs.get("end_game_flag", False)
             if end_flag and not inst._prev_end_game_flag:
+                if inst._autopilot_mode == "replay":
+                    if inst.bridge.replay_queue.empty():
+                        inst._autopilot_enabled = False
+                        inst.add_log("info", "replay", "回放完成")
+                        inst.bridge.send_control("pause")
+                        break
+                    inst.add_log("info", "replay", "Episode结束, 开始下一轮")
                 inst._last_obs_state = None
                 inst._prev_end_game_flag = True
                 await asyncio.sleep(0.01)
@@ -921,23 +1429,37 @@ async def _autopilot_loop():
                 await asyncio.sleep(0.1)
                 continue
 
+            game_loop = obs.get("game_loop", 0)
+
             if inst._last_obs_state == state_id:
                 await asyncio.sleep(0.05)
                 continue
 
             inst._last_obs_state = state_id
+
+            if inst._autopilot_mode == "replay":
+                await asyncio.sleep(0.01)
+                continue
+
             loop = asyncio.get_event_loop()
             action, event_type, plan_snap = await loop.run_in_executor(
                 None, inst._autopilot_decide, state_id
             )
 
+            if plan_snap is not None:
+                plan_snap["game_loop"] = game_loop
+
             if action is not None:
-                inst.bridge.put_action(action)
+                inst.bridge.put_action(
+                    {
+                        "action_code": action,
+                        "plan_snap": plan_snap,
+                        "event_type": event_type,
+                    }
+                )
                 inst._autopilot_stats["last_action"] = action
                 inst._autopilot_stats["last_state"] = state_id
                 inst.add_log("info", "autopilot", f"S{state_id} → {action}")
-                if plan_snap is not None:
-                    inst._current_plans.append(plan_snap)
 
             await asyncio.sleep(0.01)
     except asyncio.CancelledError:
@@ -997,6 +1519,20 @@ def create_app(bridge: GameBridge) -> FastAPI:
         status = _instance._refresh_status()
         status.update(_instance.history_stats())
         return status
+
+    @app.get("/game/state_space")
+    async def get_state_space():
+        if not _instance or _instance._mds_coords is None:
+            return {"coords": {}, "total": 0}
+        coords = _instance._mds_coords
+        N = coords.shape[0]
+        result = {}
+        for i in range(N):
+            result[str(i)] = [
+                round(float(coords[i, 0]), 4),
+                round(float(coords[i, 1]), 4),
+            ]
+        return {"coords": result, "total": N}
 
     @app.get("/game/observation")
     async def get_observation():
@@ -1075,8 +1611,9 @@ def create_app(bridge: GameBridge) -> FastAPI:
 
     @app.post("/game/autopilot")
     async def autopilot(req: AutopilotRequest):
-        if not _instance.kg_loaded:
-            raise HTTPException(status_code=400, detail="KG not loaded.")
+        if req.enabled and req.mode != "replay":
+            if not _instance.kg_loaded:
+                raise HTTPException(status_code=400, detail="KG not loaded.")
 
         if req.enabled:
             if _instance._autopilot_enabled:
@@ -1104,43 +1641,10 @@ def create_app(bridge: GameBridge) -> FastAPI:
     ):
         all_eps = []
         for ep_id in sorted(_instance._history_store.keys()):
-            frames = _instance._history_store[ep_id]
-            meta = _instance._history_meta.get(ep_id, {})
-            markov_flow = []
-            events_list = []
-            for fr in frames:
-                nid = fr.get("nid")
-                if nid is None:
-                    nid = fr.get("state_cluster", (0, 0))
-                markov_flow.append([nid, fr.get("action_code", fr.get("action", ""))])
-                events_list.append(
-                    {
-                        "state_id": nid,
-                        "action": fr.get("action", ""),
-                        "event_type": fr.get("action_source", ""),
-                        "my_count": fr.get("my_count", 0),
-                        "enemy_count": fr.get("enemy_count", 0),
-                        "hp_my": fr.get("hp_my", 0),
-                        "hp_enemy": fr.get("hp_enemy", 0),
-                        "game_loop": fr.get("game_loop", 0),
-                        "end_game_flag": fr.get("end_game_flag", False),
-                    }
-                )
-            all_eps.append(
-                {
-                    "id": ep_id,
-                    "result": meta.get("result", "Unknown"),
-                    "score": meta.get("score", 0.0),
-                    "markov_flow": markov_flow,
-                    "events": events_list,
-                    "plans": meta.get("plans", []),
-                    "timestamp": meta.get("timestamp", ""),
-                    "mode": meta.get("mode", ""),
-                    "steps": len(frames),
-                    "match_mode": "",
-                    "source": "agent",
-                }
-            )
+            detail = _instance._build_episode_detail(ep_id)
+            if detail is None:
+                continue
+            all_eps.append(detail)
         if search:
             search_lower = search.lower()
             all_eps = [
@@ -1178,20 +1682,28 @@ def create_app(bridge: GameBridge) -> FastAPI:
 
     @app.post("/game/episodes/clear")
     async def clear_episodes():
-        _instance._current_plans.clear()
         _instance._history_store.clear()
         _instance._history_meta.clear()
+        _instance._ep_detail_cache.clear()
         _instance.add_log("info", "system", "对局记录已清空")
         return {"ok": True}
 
     @app.post("/game/action")
     async def send_action(req: ActionRequest):
-        _instance.bridge.put_action(req.action)
+        _instance.bridge.put_action(
+            {"action_code": req.action, "plan_snap": None, "event_type": "manual"}
+        )
         return {"status": "queued", "action": req.action}
 
     @app.post("/game/fallback")
     async def set_fallback(req: FallbackRequest):
-        _instance.bridge.put_action(f"__fallback:{req.action}")
+        _instance.bridge.put_action(
+            {
+                "action_code": f"__fallback:{req.action}",
+                "plan_snap": None,
+                "event_type": "manual",
+            }
+        )
         return {"status": "fallback_set", "action": req.action}
 
     @app.post("/game/control")
@@ -1317,11 +1829,15 @@ def create_app(bridge: GameBridge) -> FastAPI:
 
             def _do_move():
                 import time
+                import ctypes
 
-                time.sleep(0.3)
-                hwnd = ctypes.windll.user32.FindWindowW(None, "StarCraft II")
-                if hwnd:
-                    ctypes.windll.user32.SetWindowPos(hwnd, 0, x, y, w, h, 0x0040)
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    hwnd = ctypes.windll.user32.FindWindowW(None, "StarCraft II")
+                    if hwnd:
+                        ctypes.windll.user32.SetWindowPos(hwnd, 0, x, y, w, h, 0x0040)
+                        return
+                    time.sleep(0.3)
 
             threading.Thread(target=_do_move, daemon=True).start()
             _instance.add_log("info", "system", f"窗口移动: ({x},{y}) {w}x{h}")

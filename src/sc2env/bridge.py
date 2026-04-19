@@ -26,6 +26,7 @@ class GameBridge:
         self._stop_event = Event()
         self._run_episode_event = Event()
         self.history_queue: Queue = Queue(maxsize=100)
+        self.replay_queue: Queue = Queue()
 
     # ---- Agent → API ----
 
@@ -77,15 +78,17 @@ class GameBridge:
 
     # ---- API → Agent ----
 
-    def put_action(self, action_name: str) -> None:
+    def put_action(self, payload) -> None:
+        if isinstance(payload, str):
+            payload = {"action_code": payload, "plan_snap": None}
         try:
             if not self.action_queue.empty():
                 self.action_queue.get_nowait()
-            self.action_queue.put_nowait(action_name)
+            self.action_queue.put_nowait(payload)
         except Exception:
             pass
 
-    def get_action(self, timeout: float = 0.05) -> Optional[str]:
+    def get_action(self, timeout: float = 0.05) -> Optional[Dict[str, Any]]:
         try:
             return self.action_queue.get(timeout=timeout)
         except Exception:
@@ -153,3 +156,21 @@ class GameBridge:
         except Exception:
             pass
         return result
+
+    # ---- Replay ----
+
+    def load_replay_actions(self, actions: List[str], runs: int = 1) -> None:
+        try:
+            while not self.replay_queue.empty():
+                self.replay_queue.get_nowait()
+        except Exception:
+            pass
+        for _ in range(runs):
+            for a in actions:
+                self.replay_queue.put(a)
+
+    def get_replay_action(self) -> Optional[str]:
+        try:
+            return self.replay_queue.get_nowait()
+        except Exception:
+            return None

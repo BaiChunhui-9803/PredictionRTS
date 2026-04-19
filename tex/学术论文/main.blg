@@ -3,44 +3,46 @@ Capacity: max_strings=200000, hash_size=200000, hash_prime=170003
 The top-level auxiliary file: main.aux
 The style file: aaai24.bst
 Database file #1: references.bib
-You've used 8 entries,
+Warning--empty journal in watkins1989qlearning
+You've used 16 entries,
             2840 wiz_defined-function locations,
-            620 strings with 5710 characters,
-and the built_in function-call counts, 4601 in all, are:
-= -- 344
-> -- 257
+            665 strings with 7207 characters,
+and the built_in function-call counts, 9725 in all, are:
+= -- 725
+> -- 587
 < -- 0
-+ -- 95
-- -- 86
-* -- 303
-:= -- 801
-add.period$ -- 32
-call.type$ -- 8
-change.case$ -- 65
-chr.to.int$ -- 9
-cite$ -- 8
-duplicate$ -- 328
-empty$ -- 319
-format.name$ -- 106
-if$ -- 873
++ -- 221
+- -- 202
+* -- 671
+:= -- 1709
+add.period$ -- 63
+call.type$ -- 16
+change.case$ -- 133
+chr.to.int$ -- 17
+cite$ -- 17
+duplicate$ -- 665
+empty$ -- 629
+format.name$ -- 240
+if$ -- 1821
 int.to.chr$ -- 1
 int.to.str$ -- 1
-missing$ -- 70
-newline$ -- 44
-num.names$ -- 32
-pop$ -- 188
+missing$ -- 151
+newline$ -- 83
+num.names$ -- 64
+pop$ -- 349
 preamble$ -- 1
-purify$ -- 55
+purify$ -- 121
 quote$ -- 0
-skip$ -- 149
+skip$ -- 288
 stack$ -- 0
-substring$ -- 90
-swap$ -- 136
+substring$ -- 240
+swap$ -- 302
 text.length$ -- 0
 text.prefix$ -- 0
 top$ -- 0
-type$ -- 69
-warning$ -- 0
-while$ -- 32
+type$ -- 141
+warning$ -- 1
+while$ -- 70
 width$ -- 0
-write$ -- 99
+write$ -- 196
+(There was 1 warning)

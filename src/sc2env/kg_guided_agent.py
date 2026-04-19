@@ -127,10 +127,12 @@ class KGGuidedAgent(SmartAgent):
         return None
 
     def _build_observation_dict(
-        self, obs, state_cluster=None, norm_state=None
+        self, obs, state_cluster=None, norm_state=None, my_units=None, enemy_units=None
     ) -> Dict[str, Any]:
-        my_units = self.get_my_units_by_type(obs, _MAP["unit_type"])
-        enemy_units = self.get_enemy_units_by_type(obs, _MAP["unit_type"])
+        if my_units is None:
+            my_units = self.get_my_units_by_type(obs, _MAP["unit_type"])
+        if enemy_units is None:
+            enemy_units = self.get_enemy_units_by_type(obs, _MAP["unit_type"])
 
         my_units_info = [
             {
@@ -324,7 +326,27 @@ class KGGuidedAgent(SmartAgent):
             if self.end_game_frames > obs.observation.game_loop:
                 self.end_game_frames = obs.observation.game_loop
 
-        state_norm = self.get_norm_state(obs)
+        map_resolution = _ENV_CONFIG["_MAP_RESOLUTION"]
+        my_sorted = sorted(my_units, key=lambda u: u.tag)
+        enemy_sorted = sorted(enemy_units, key=lambda u: u.tag)
+        state_norm = {
+            "red_army": [
+                (
+                    u.x / (map_resolution / 2) - 1.0,
+                    1.0 - u.y / (map_resolution / 2),
+                    u.health / 45.0,
+                )
+                for u in my_sorted
+            ],
+            "blue_army": [
+                (
+                    u.x / (map_resolution / 2) - 1.0,
+                    1.0 - u.y / (map_resolution / 2),
+                    u.health / 45.0,
+                )
+                for u in enemy_sorted
+            ],
+        }
         state_cluster = self.get_state_cluster(state_norm)
         self._prev_state_cluster = state_cluster
 
@@ -342,7 +364,11 @@ class KGGuidedAgent(SmartAgent):
         )
 
         obs_dict = self._build_observation_dict(
-            obs, state_cluster=state_cluster, norm_state=state_norm
+            obs,
+            state_cluster=state_cluster,
+            norm_state=state_norm,
+            my_units=my_units,
+            enemy_units=enemy_units,
         )
         self.bridge.put_observation(obs_dict)
         self.bridge.update_status(
@@ -352,30 +378,66 @@ class KGGuidedAgent(SmartAgent):
             state_cluster=obs_dict["state_cluster_str"],
         )
 
-        external_action = self.bridge.get_action(timeout=0.05)
-        action_to_execute = None
-        action_source = "fallback"
-        action_code = "4c"
-
-        if external_action is not None:
-            resolved = self._resolve_action(external_action)
+        replay_action = self.bridge.get_replay_action()
+        if replay_action is not None:
+            resolved = self._resolve_action(replay_action)
             if resolved is not None:
                 action_to_execute = resolved
-                action_source = "external"
-                action_code = external_action
+                action_source = "replay"
+                action_code = replay_action
+                plan_snap = None
             else:
                 action_to_execute = self._resolve_action(self._fallback_action)
-                action_source = f"fallback_unknown({external_action})"
-
-        if action_to_execute is None:
-            action_to_execute = self._resolve_action(self._fallback_action)
-            if action_to_execute is None:
-                action_to_execute = "action_ATK_nearest_weakest"
+                action_source = "replay_fallback"
+                action_code = "4c"
+                plan_snap = None
+        else:
+            external_action = self.bridge.get_action(timeout=0.05)
+            action_to_execute = None
             action_source = "fallback"
+            action_code = "4c"
+            plan_snap = None
 
-        if action_source == "fallback" and action_to_execute in self.actions:
-            a_idx = self.actions.index(action_to_execute)
-            action_code = "4" + chr(ord("a") + a_idx)
+            if external_action is not None:
+                if isinstance(external_action, dict):
+                    action_code_raw = external_action.get("action_code")
+                    plan_snap = external_action.get("plan_snap")
+                    evt_type = external_action.get("event_type")
+                    if action_code_raw is not None:
+                        resolved = self._resolve_action(action_code_raw)
+                        if resolved is not None:
+                            action_to_execute = resolved
+                            action_source = evt_type if evt_type else "external"
+                            action_code = action_code_raw
+                        else:
+                            action_to_execute = self._resolve_action(
+                                self._fallback_action
+                            )
+                            action_source = f"fallback_unknown({action_code_raw})"
+                    else:
+                        action_to_execute = self._resolve_action(self._fallback_action)
+                        if action_to_execute is None:
+                            action_to_execute = "action_ATK_nearest_weakest"
+                        action_source = "fallback"
+                else:
+                    resolved = self._resolve_action(external_action)
+                    if resolved is not None:
+                        action_to_execute = resolved
+                        action_source = "external"
+                        action_code = external_action
+                    else:
+                        action_to_execute = self._resolve_action(self._fallback_action)
+                        action_source = f"fallback_unknown({external_action})"
+
+            if action_to_execute is None:
+                action_to_execute = self._resolve_action(self._fallback_action)
+                if action_to_execute is None:
+                    action_to_execute = "action_ATK_nearest_weakest"
+                action_source = "fallback"
+
+            if action_source == "fallback" and action_to_execute in self.actions:
+                a_idx = self.actions.index(action_to_execute)
+                action_code = "4" + chr(ord("a") + a_idx)
 
         self._last_action_executed = action_to_execute
         self._record_action(state_cluster, action_to_execute, action_source)
@@ -397,6 +459,14 @@ class KGGuidedAgent(SmartAgent):
                 "hp_enemy": hp_enemy,
                 "game_loop": int(obs.observation.game_loop[0]),
                 "end_game_flag": self.end_game_flag,
+                "plan": plan_snap,
+                "my_units_pos": [
+                    {"x": float(u.x), "y": float(u.y), "hp": u.health} for u in my_units
+                ],
+                "enemy_units_pos": [
+                    {"x": float(u.x), "y": float(u.y), "hp": u.health}
+                    for u in enemy_units
+                ],
             }
         )
 
