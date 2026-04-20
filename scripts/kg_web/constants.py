@@ -8,6 +8,7 @@ from src import ROOT_DIR
 KG_DIR = ROOT_DIR / "cache" / "knowledge_graph"
 NPY_DIR = ROOT_DIR / "cache" / "npy"
 DATA_DIR = ROOT_DIR / "data"
+RESULTS_DIR = ROOT_DIR / "output" / "live_results"
 
 _BEAM_COLORS = [
     "#e6194b",

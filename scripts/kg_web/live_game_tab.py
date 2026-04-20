@@ -291,6 +291,22 @@ def _render_live_game_sidebar(kg_entry: Optional[Dict] = None):
         cmd.extend(["--max_state_revisits", str(st.session_state.get("live_msr", 2))])
         cmd.extend(["--min_cum_prob", str(st.session_state.get("live_mcp", 0.01))])
         cmd.extend(["--discount_factor", str(st.session_state.get("live_df", 0.9))])
+        cmd.extend(["--action_strategy", st.session_state.get("live_as", "best_beam")])
+        cmd.extend(["--epsilon", str(st.session_state.get("live_eps", 0.1))])
+        if live_backup:
+            cmd.append("--enable_backup")
+            cmd.extend(
+                [
+                    "--backup_score_threshold",
+                    str(st.session_state.get("live_backup_st", 0.3)),
+                ]
+            )
+            cmd.extend(
+                [
+                    "--backup_distance_threshold",
+                    str(st.session_state.get("live_backup_dt", 0.2)),
+                ]
+            )
         p = subprocess.Popen(
             cmd,
             cwd=str(ROOT_DIR),

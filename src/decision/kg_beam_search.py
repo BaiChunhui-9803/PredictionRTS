@@ -11,25 +11,29 @@ Core idea:
   metric, pruning branches whose cumulative probability drops below a
   threshold.
 
-Usage:
-    from src.decision.kg_beam_search import beam_search_predict, find_optimal_action
+Unified planning entry point:
+    from src.decision.kg_beam_search import plan_action
 
-    # Run beam search
-    results = beam_search_predict(kg, transitions, start_state=42,
-                                  beam_width=3, max_steps=5)
+    plan = plan_action(kg, transitions, state=42,
+                       action_strategy="best_beam")
+    print(plan.recommended_action, plan.action_plan)
 
-    # Quick optimal-action recommendation
+Backward-compatible shortcut:
     action, info = find_optimal_action(kg, transitions, state=42)
 """
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Tuple
 
 import numpy as np
 
 from src.decision.knowledge_graph import DecisionKnowledgeGraph
+
+
+_COMPOSITE_WEIGHTS: Tuple[float, float, float, float] = (0.30, 0.30, 0.30, 0.10)
 
 
 @dataclass
@@ -44,6 +48,18 @@ class BeamSearchResult:
     avg_future_reward: float
     beam_id: int
     parent_idx: Optional[int]
+
+
+@dataclass
+class PlanResult:
+    recommended_action: Optional[str] = None
+    ranked_actions: List[str] = field(default_factory=list)
+    action_plan: List[str] = field(default_factory=list)
+    planned_states: List[int] = field(default_factory=list)
+    beam_results: List[BeamSearchResult] = field(default_factory=list)
+    beam_paths: List[List[BeamSearchResult]] = field(default_factory=list)
+    best_path_index: int = 0
+    metrics: Dict[str, Any] = field(default_factory=dict)
 
 
 class _BeamNode:
@@ -247,7 +263,130 @@ def beam_search_predict(
     return all_nodes
 
 
-def find_optimal_action(
+def _compute_path_composite(path: List[BeamSearchResult]) -> float:
+    if not path:
+        return 0.0
+    non_root = path[1:] if len(path) > 1 else path
+    if not non_root:
+        return 1.0
+    cum_prob = path[-1].cumulative_probability
+    avg_quality = float(np.mean([r.quality_score for r in non_root]))
+    avg_win_rate = float(np.mean([r.win_rate for r in non_root]))
+    avg_reward = float(np.mean([r.avg_future_reward for r in non_root]))
+    vals = [cum_prob, avg_quality, avg_win_rate, avg_reward]
+    mn, mx = min(vals), max(vals)
+    if mx <= mn:
+        return 0.5
+    normed = [(v - mn) / (mx - mn) for v in vals]
+    w_conf, w_qual, w_wr, w_rwd = _COMPOSITE_WEIGHTS
+    return (
+        w_conf * normed[0] + w_qual * normed[1] + w_wr * normed[2] + w_rwd * normed[3]
+    )
+
+
+def _rank_actions_from_beam(
+    beam_results: List[BeamSearchResult],
+    state_trans: Dict[str, Dict],
+    action_strategy: str = "best_beam",
+    epsilon: float = 0.1,
+    rng: Optional[np.random.RandomState] = None,
+) -> List[str]:
+    if not beam_results or len(beam_results) <= 1:
+        return []
+
+    if rng is None:
+        rng = np.random.RandomState()
+
+    root = beam_results[0]
+    direct_children: Dict[int, BeamSearchResult] = {}
+    for i, r in enumerate(beam_results):
+        if i == 0:
+            continue
+        if r.parent_idx == 0:
+            direct_children[i] = r
+
+    groups: Dict[str, List[BeamSearchResult]] = defaultdict(list)
+    all_descendants: Dict[str, List[int]] = defaultdict(list)
+
+    child_indices = set(direct_children.keys())
+    for i, r in enumerate(beam_results):
+        if i == 0:
+            continue
+        current = r
+        chain = [i]
+        ancestor = current.parent_idx
+        while ancestor is not None and ancestor != 0:
+            chain.append(ancestor)
+            if ancestor < len(beam_results):
+                ancestor = beam_results[ancestor].parent_idx
+            else:
+                break
+        for ci in child_indices:
+            if ci in chain:
+                action = direct_children[ci].action
+                if action:
+                    groups[action].append(r)
+                    all_descendants[action].extend(chain)
+                break
+
+    for ci, child in direct_children.items():
+        action = child.action
+        if action and action not in groups:
+            groups[action] = []
+            all_descendants[action] = [ci]
+
+    if not groups:
+        seen = set()
+        for ci, child in direct_children.items():
+            if child.action and child.action not in seen:
+                seen.add(child.action)
+        return list(seen)
+
+    action_metrics: Dict[str, Dict[str, Any]] = {}
+    for action, child_nodes in groups.items():
+        desc_ids = list(set(all_descendants.get(action, [])))
+        desc_nodes = [beam_results[d] for d in desc_ids if d < len(beam_results)]
+        all_nodes = desc_nodes if desc_nodes else child_nodes
+
+        trans_total = 0
+        ti = state_trans.get(action, {})
+        ns = ti.get("next_states", {})
+        if ns:
+            trans_total = sum(ns.values())
+
+        beam_ids = [n.beam_id for n in child_nodes]
+        action_metrics[action] = {
+            "beam_rank": min(beam_ids) if beam_ids else 999,
+            "max_quality": max(n.quality_score for n in all_nodes),
+            "avg_win_rate": float(np.mean([n.win_rate for n in all_nodes])),
+            "avg_future_reward": float(
+                np.mean([n.avg_future_reward for n in all_nodes])
+            ),
+            "trans_total": trans_total,
+        }
+
+    items = list(action_metrics.items())
+
+    if action_strategy == "best_beam":
+        items.sort(key=lambda x: x[1]["beam_rank"])
+    elif action_strategy == "best_subtree_quality":
+        items.sort(key=lambda x: x[1]["max_quality"], reverse=True)
+    elif action_strategy == "best_subtree_winrate":
+        items.sort(key=lambda x: x[1]["avg_win_rate"], reverse=True)
+    elif action_strategy == "highest_transition_prob":
+        items.sort(key=lambda x: x[1]["trans_total"], reverse=True)
+    elif action_strategy == "random_beam":
+        rng.shuffle(items)
+    elif action_strategy == "epsilon_greedy":
+        if rng.random() < epsilon and len(items) > 1:
+            rng.shuffle(items)
+        else:
+            items.sort(key=lambda x: x[1]["beam_rank"])
+
+    return [action for action, _ in items]
+
+
+def plan_action(
     kg: DecisionKnowledgeGraph,
     transitions: Dict[int, Dict[str, Dict]],
     state: int,
@@ -258,33 +397,13 @@ def find_optimal_action(
     score_mode: str = "quality",
     max_state_revisits: int = 2,
     discount_factor: float = 0.9,
-) -> Tuple[Optional[str], Dict[str, Any]]:
-    """
-    Recommend the best first action from *state* using beam search.
+    action_strategy: str = "best_beam",
+    epsilon: float = 0.1,
+    rng_seed: Optional[int] = None,
+) -> PlanResult:
+    rng = np.random.RandomState(rng_seed)
 
-    Returns:
-        (action, info_dict)  where info_dict contains:
-          - recommended_action
-          - expected_cumulative_reward: mean avg_future_reward along best beam
-          - expected_win_rate: mean win_rate along best beam
-          - best_beam_cum_prob: cumulative probability of best beam
-          - best_beam_length: number of steps in best beam
-          - all_results: full beam search results
-    """
-    top_actions = kg.get_top_k_actions(
-        state=state,
-        k=5,
-        min_visits=min_visits,
-        metric="quality_score",
-    )
-
-    if not top_actions:
-        return None, {"reason": "no_actions"}
-
-    best_action = top_actions[0][0]
-    best_quality = top_actions[0][1]
-
-    results = beam_search_predict(
+    beam_results = beam_search_predict(
         kg,
         transitions,
         state,
@@ -297,47 +416,113 @@ def find_optimal_action(
         discount_factor=discount_factor,
     )
 
-    if not results:
-        return best_action, {
-            "recommended_action": best_action,
-            "expected_cumulative_reward": best_quality.get("avg_future_reward", 0.0),
-            "expected_win_rate": best_quality.get("win_rate", 0.0),
-            "best_beam_cum_prob": 0.0,
-            "best_beam_length": 0,
-            "all_results": [],
-            "reason": "no_transitions",
-        }
-
-    real_paths = get_beam_paths(results)
-
-    if real_paths:
-        best_path = max(real_paths, key=lambda p: p[-1].cumulative_probability)
-        avg_reward = (
-            float(np.mean([r.avg_future_reward for r in best_path[1:]]))
-            if len(best_path) > 1
-            else 0.0
+    if not beam_results:
+        return PlanResult(
+            recommended_action=None,
+            metrics={"reason": "no_actions"},
         )
-        avg_wr = (
-            float(np.mean([r.win_rate for r in best_path[1:]]))
-            if len(best_path) > 1
-            else 0.0
-        )
-        cum_prob = best_path[-1].cumulative_probability
-        beam_len = len(best_path) - 1
-    else:
-        avg_reward = best_quality.get("avg_future_reward", 0.0)
-        avg_wr = best_quality.get("win_rate", 0.0)
-        cum_prob = 0.0
-        beam_len = 0
 
-    return best_action, {
-        "recommended_action": best_action,
+    beam_paths = get_beam_paths(beam_results)
+
+    if not beam_paths:
+        return PlanResult(
+            recommended_action=None,
+            beam_results=beam_results,
+            metrics={"reason": "no_paths"},
+        )
+
+    composites = [_compute_path_composite(p) for p in beam_paths]
+    best_path_index = int(np.argmax(composites))
+    best_path = beam_paths[best_path_index]
+
+    action_plan: List[str] = []
+    planned_states: List[int] = []
+    for node in best_path:
+        planned_states.append(node.state)
+        if node.action:
+            action_plan.append(node.action)
+
+    ranked_actions: List[str] = []
+    recommended_action: Optional[str] = None
+    if len(beam_results) > 1:
+        state_trans = transitions.get(state, {})
+        ranked_actions = _rank_actions_from_beam(
+            beam_results,
+            state_trans,
+            action_strategy=action_strategy,
+            epsilon=epsilon,
+            rng=rng,
+        )
+        recommended_action = ranked_actions[0] if ranked_actions else None
+
+    if recommended_action is None and action_plan:
+        recommended_action = action_plan[0]
+
+    non_root = best_path[1:] if len(best_path) > 1 else []
+    avg_reward = (
+        float(np.mean([r.avg_future_reward for r in non_root])) if non_root else 0.0
+    )
+    avg_wr = float(np.mean([r.win_rate for r in non_root])) if non_root else 0.0
+    cum_prob = best_path[-1].cumulative_probability if best_path else 0.0
+
+    metrics: Dict[str, Any] = {
+        "recommended_action": recommended_action,
         "expected_cumulative_reward": round(avg_reward, 4),
         "expected_win_rate": round(avg_wr, 4),
         "best_beam_cum_prob": round(cum_prob, 6),
-        "best_beam_length": beam_len,
-        "all_results": results,
+        "best_beam_length": len(best_path) - 1,
     }
+
+    return PlanResult(
+        recommended_action=recommended_action,
+        ranked_actions=ranked_actions,
+        action_plan=action_plan,
+        planned_states=planned_states,
+        beam_results=beam_results,
+        beam_paths=beam_paths,
+        best_path_index=best_path_index,
+        metrics=metrics,
+    )
+
+
+def find_optimal_action(
+    kg: DecisionKnowledgeGraph,
+    transitions: Dict[int, Dict[str, Dict]],
+    state: int,
+    beam_width: int = 3,
+    max_steps: int = 5,
+    min_visits: int = 1,
+    min_cum_prob: float = 0.01,
+    score_mode: str = "quality",
+    max_state_revisits: int = 2,
+    discount_factor: float = 0.9,
+    action_strategy: str = "best_beam",
+    epsilon: float = 0.1,
+    rng_seed: Optional[int] = None,
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    plan = plan_action(
+        kg,
+        transitions,
+        state,
+        beam_width=beam_width,
+        max_steps=max_steps,
+        min_visits=min_visits,
+        min_cum_prob=min_cum_prob,
+        score_mode=score_mode,
+        max_state_revisits=max_state_revisits,
+        discount_factor=discount_factor,
+        action_strategy=action_strategy,
+        epsilon=epsilon,
+        rng_seed=rng_seed,
+    )
+    info: Dict[str, Any] = dict(plan.metrics)
+    info["all_results"] = plan.beam_results
+    info["ranked_actions"] = plan.ranked_actions
+    info["action_plan"] = plan.action_plan
+    info["planned_states"] = plan.planned_states
+    info["beam_paths"] = plan.beam_paths
+    info["best_path_index"] = plan.best_path_index
+    return plan.recommended_action, info
 
 
 def get_beam_paths(

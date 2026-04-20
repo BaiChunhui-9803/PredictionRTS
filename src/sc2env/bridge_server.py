@@ -990,6 +990,126 @@ def create_app(bridge: GameBridge) -> FastAPI:
         _instance.add_log("info", "system", "对局记录已清空")
         return {"ok": True}
 
+    @app.post("/game/results/save")
+    async def save_results(req: dict = None):
+        max_count = req.get("max_count", 100) if req else 100
+        _instance._drain_history()
+        if not _instance._history_store:
+            raise HTTPException(status_code=404, detail="没有可保存的对局记录")
+
+        status = _instance._refresh_status()
+        mode = status.get("agent_mode", status.get("mode", "unknown"))
+        kg_file = status.get("kg_file", "")
+        map_id = "unknown"
+        if kg_file:
+            parts = Path(kg_file).parent.name
+            map_id = parts if parts else "unknown"
+
+        all_ids = sorted(_instance._history_meta.keys())
+        selected_ids = all_ids[:max_count]
+
+        episodes = []
+        for ep_id in selected_ids:
+            meta = _instance._history_meta.get(ep_id, {})
+            frames_raw = _instance._history_store.get(ep_id, [])
+            frames_light = []
+            for fr in frames_raw:
+                frames_light.append(
+                    {
+                        "state_cluster": fr.get("state_cluster"),
+                        "nid": fr.get("nid"),
+                        "action": fr.get("action", ""),
+                        "action_code": fr.get("action_code", ""),
+                        "action_source": fr.get("action_source", ""),
+                        "my_count": fr.get("my_count", 0),
+                        "enemy_count": fr.get("enemy_count", 0),
+                        "hp_my": fr.get("hp_my", 0),
+                        "hp_enemy": fr.get("hp_enemy", 0),
+                        "game_loop": fr.get("game_loop", 0),
+                        "end_game_flag": fr.get("end_game_flag", False),
+                    }
+                )
+            score = 0
+            if frames_light:
+                last = frames_light[-1]
+                score = last["hp_my"] - last["hp_enemy"]
+            episodes.append(
+                {
+                    "episode_id": ep_id,
+                    "result": meta.get("result", "Unknown"),
+                    "score": meta.get("score", score),
+                    "num_frames": len(frames_light),
+                    "frames": frames_light,
+                }
+            )
+
+        agent_params = status.get("agent_params", {})
+        backup_enabled = agent_params.get("enable_backup", False)
+
+        payload = {
+            "metadata": {
+                "map_id": map_id,
+                "mode": mode,
+                "kg_file": kg_file,
+                "backup_enabled": backup_enabled,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "num_episodes": len(episodes),
+                "source": "live_game",
+            },
+            "params": agent_params if agent_params else {},
+            "episodes": episodes,
+        }
+
+        results_dir = ROOT_DIR / "output" / "live_results" / map_id
+        results_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        mode_label = mode
+        if backup_enabled and mode not in ("single_step", "replay"):
+            mode_label = f"{mode}_backup"
+        filename = f"{mode_label}_{ts}.json"
+        filepath = results_dir / filename
+        with open(str(filepath), "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+        _instance.add_log(
+            "success",
+            "system",
+            f"结果已保存: {filepath} ({len(episodes)} 局)",
+        )
+        return {
+            "ok": True,
+            "path": str(filepath),
+            "num_episodes": len(episodes),
+            "filename": filename,
+        }
+
+    @app.get("/game/results/list")
+    async def list_results():
+        results_root = ROOT_DIR / "output" / "live_results"
+        if not results_root.exists():
+            return {"results": []}
+        items = []
+        for jf in sorted(
+            results_root.rglob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True
+        ):
+            try:
+                with open(str(jf), "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                meta = data.get("metadata", {})
+                items.append(
+                    {
+                        "path": str(jf),
+                        "filename": jf.name,
+                        "map_id": meta.get("map_id", ""),
+                        "mode": meta.get("mode", ""),
+                        "timestamp": meta.get("timestamp", ""),
+                        "num_episodes": meta.get("num_episodes", 0),
+                    }
+                )
+            except Exception:
+                continue
+        return {"results": items}
+
     @app.post("/game/action")
     async def send_action(req: ActionRequest):
         _instance.bridge.put_action(

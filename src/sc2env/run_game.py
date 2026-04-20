@@ -339,6 +339,7 @@ def run_game(
     replay_actions: Optional[list] = None,
     replay_runs: int = 1,
     kg_file: Optional[str] = None,
+    action_strategy: str = "best_beam",
 ):
     steps = _ENV_CONFIG["_MAX_STEP"]
     step_mul = _ENV_CONFIG["_STEP_MUL"]
@@ -470,6 +471,7 @@ def run_game(
             beam_params=beam_params or {},
             replay_actions=replay_actions,
             replay_runs=replay_runs,
+            action_strategy=action_strategy,
         )
     else:
         agent1 = SmartAgent()

@@ -25,6 +25,7 @@ from kg_web.prediction_tab import _render_prediction_tab
 from kg_web.rollout_tab import _render_rollout_tab
 from kg_web.raw_data_tab import _render_raw_data_tab
 from kg_web.live_game_tab import _render_live_game_sidebar, _render_live_game_content
+from kg_web.results_tab import _render_results_tab
 
 
 def main():
@@ -37,8 +38,15 @@ def main():
     st.title("🕸️ Experience Transition Graph Explorer")
     st.markdown("交互式浏览经验转移图 + 图上束搜索规划。")
 
-    _TAB_OPTIONS = ["转移图可视化", "束搜索规划", "滚动推演", "原始数据", "实时对局"]
-    _TAB_ICONS = ["🕸️", "🔮", "🎮", "📊", "⚡"]
+    _TAB_OPTIONS = [
+        "转移图可视化",
+        "束搜索规划",
+        "滚动推演",
+        "原始数据",
+        "实时对局",
+        "结果分析",
+    ]
+    _TAB_ICONS = ["🕸️", "🔮", "🎮", "📊", "⚡", "📈"]
 
     with st.sidebar:
         _sel = st.segmented_control(
@@ -497,6 +505,9 @@ def main():
 
     elif active_tab == 4:
         _render_live_game_content()
+
+    elif active_tab == 5:
+        _render_results_tab()
 
 
 if __name__ == "__main__":

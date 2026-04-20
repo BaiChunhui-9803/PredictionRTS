@@ -1112,6 +1112,16 @@ class SmartAgent(Agent):
         self.end_game_frames = _ENV_CONFIG["_MAX_STEP"] * _ENV_CONFIG["_STEP_MUL"]
         self.end_game_state = "Dogfall"
         self.end_game_flag = False
+        self._termination_signaled = False
+        self.score_attack_max = 0
+        self.score_defense_max = 0
+        self.score_cumulative_attack_last = 0
+        self.score_cumulative_defense_last = 0
+        self.previous_clu_state = None
+        self.previous_clu_action = None
+        self.previous_obs = {}
+        self.current_obs = {}
+        self.action_queue.clear()
 
     def get_window_im(self, obs):
         my_units = self.get_my_units_by_type(obs, _MAP["unit_type"])

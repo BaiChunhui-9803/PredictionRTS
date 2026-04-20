@@ -71,6 +71,7 @@ class KGGuidedAgent(SmartAgent):
         beam_params: Optional[Dict[str, Any]] = None,
         replay_actions: Optional[List[str]] = None,
         replay_runs: int = 1,
+        action_strategy: str = "best_beam",
     ):
         super(KGGuidedAgent, self).__init__()
         self.bridge = bridge
@@ -90,14 +91,13 @@ class KGGuidedAgent(SmartAgent):
         self._dist_matrix = dist_matrix
         self._mode = mode
         self._beam_params = beam_params or {}
-        self._replay_actions: List[str] = []
+        self._action_strategy = action_strategy
+        self._replay_actions: List[str] = list(replay_actions) if replay_actions else []
         self._replay_idx: int = 0
         self._replay_done: bool = False
-        self._replay_per_ep: int = len(replay_actions) if replay_actions else 0
+        self._replay_per_ep: int = len(self._replay_actions)
         self._replay_frame_count: int = 0
-        if replay_actions:
-            for _ in range(max(1, replay_runs)):
-                self._replay_actions.extend(replay_actions)
+        self._replay_runs_remaining: int = max(1, replay_runs) if replay_actions else 0
 
         self._action_plan: List[str] = []
         self._planned_states: List[int] = []
@@ -157,6 +157,71 @@ class KGGuidedAgent(SmartAgent):
                         tree.next_cluster_id = max_id + 1
                     self.secondary_bktree[int(cluster_id)] = tree
 
+    def new_game(self):
+        super().new_game()
+        if not hasattr(self, "_mode"):
+            return
+        self._replay_frame_count = 0
+        if self._mode == "replay" and self._replay_actions:
+            if self._ep_history:
+                self._ep_counter += 1
+                self._ep_batch.append(
+                    {
+                        "episode_id": self._ep_counter,
+                        "frames": list(self._ep_history),
+                        "result": self.end_game_state or "Dogfall",
+                        "score": 0,
+                    }
+                )
+                self._ep_history = []
+            self._flush_ep_batch()
+
+            self._replay_runs_remaining -= 1
+            if self._replay_runs_remaining > 0:
+                self._replay_idx = 0
+                self._replay_done = False
+            else:
+                self._replay_idx = len(self._replay_actions)
+
+        if hasattr(self, "ctx") and self.ctx:
+            self.ctx.episode_count += 1
+            ep = self.ctx.episode_count
+            self.bridge.update_status(
+                episode=ep,
+                agent_mode=self._mode,
+                agent_params={
+                    "mode": self._mode,
+                    "beam_width": self._beam_params.get("beam_width", 3),
+                    "max_steps": self._beam_params.get("lookahead_steps", 5),
+                    "min_visits": self._beam_params.get("min_visits", 1),
+                    "min_cum_prob": self._beam_params.get("min_cum_prob", 0.01),
+                    "score_mode": self._beam_params.get("score_mode", "quality"),
+                    "max_state_revisits": self._beam_params.get(
+                        "max_state_revisits", 2
+                    ),
+                    "discount_factor": self._beam_params.get("discount_factor", 0.9),
+                    "action_strategy": self._action_strategy,
+                    "epsilon": self._beam_params.get("epsilon", 0.1),
+                    "enable_backup": self._beam_params.get("enable_backup", False),
+                    "backup_score_threshold": self._beam_params.get(
+                        "backup_score_threshold", 0.3
+                    ),
+                    "backup_distance_threshold": self._beam_params.get(
+                        "backup_distance_threshold", 0.2
+                    ),
+                    "replay_runs": self._replay_runs_remaining
+                    + (1 if self._replay_idx < len(self._replay_actions) else 0),
+                    "replay_per_ep": self._replay_per_ep,
+                },
+            )
+            self.bridge.put_event(
+                {
+                    "level": "info",
+                    "source": "game",
+                    "message": f"Episode #{ep} 开始",
+                }
+            )
+
     def _resolve_action(self, raw_action: str) -> Optional[str]:
         self._pending_cluster = None
         if len(raw_action) == 2 and raw_action[0].isdigit() and raw_action[1].isalpha():
@@ -212,12 +277,12 @@ class KGGuidedAgent(SmartAgent):
     def _get_plan_from_beam(
         self, state_id: int, lookahead_steps: int
     ) -> Tuple[Optional[str], List[str], List[int], List[Dict], List[Dict]]:
-        from src.decision.kg_beam_search import find_optimal_action, get_beam_paths
+        from src.decision.kg_beam_search import plan_action
 
         if self.kg is None or self.transitions is None:
             return None, [], [], [], []
 
-        action, info = find_optimal_action(
+        plan = plan_action(
             self.kg,
             self.transitions,
             state_id,
@@ -228,11 +293,14 @@ class KGGuidedAgent(SmartAgent):
             score_mode=self._beam_params.get("score_mode", "quality"),
             max_state_revisits=self._beam_params.get("max_state_revisits", 2),
             discount_factor=self._beam_params.get("discount_factor", 0.9),
+            action_strategy=self._action_strategy,
         )
 
-        all_results = info.get("all_results", [])
+        if plan.recommended_action is None:
+            return None, [], [], [], []
+
         beam_dicts = []
-        for r in all_results:
+        for r in plan.beam_results:
             beam_dicts.append(
                 {
                     "step": getattr(r, "step", 0),
@@ -248,11 +316,9 @@ class KGGuidedAgent(SmartAgent):
                 }
             )
 
-        paths = get_beam_paths(all_results) if all_results else []
-        paths.sort(key=lambda p: p[-1].cumulative_probability, reverse=True)
         beam_paths = []
-        for rank, path in enumerate(paths):
-            is_chosen = rank == 0
+        for rank, path in enumerate(plan.beam_paths):
+            is_chosen = rank == plan.best_path_index
             path_steps = []
             for node in path:
                 path_steps.append(
@@ -272,22 +338,13 @@ class KGGuidedAgent(SmartAgent):
                 }
             )
 
-        actions = [action] if action else []
-        states = [state_id]
-        if all_results and action:
-            best_path_nodes = paths[0] if paths else None
-            if best_path_nodes and len(best_path_nodes) > 1:
-                actions = []
-                states = []
-                for node in best_path_nodes:
-                    states.append(node.state)
-                    if node.action:
-                        actions.append(node.action)
-                if states and states[0] != state_id:
-                    states.insert(0, state_id)
-
-        first_action = actions[0] if actions else None
-        return first_action, actions, states, beam_dicts, beam_paths
+        return (
+            plan.recommended_action,
+            plan.action_plan,
+            plan.planned_states,
+            beam_dicts,
+            beam_paths,
+        )
 
     def _local_decide(self, state_id: int) -> Tuple[Optional[str], str, Optional[Dict]]:
         if self.kg is None or self.transitions is None:
@@ -409,11 +466,6 @@ class KGGuidedAgent(SmartAgent):
                 self._ep_history = []
                 self._replay_frame_count = 0
             self._flush_ep_batch()
-            self.new_game()
-            self.end_game_frames = _ENV_CONFIG["_MAX_STEP"] * _ENV_CONFIG["_STEP_MUL"]
-            if self.end_game_flag != True:
-                self.end_game_state = "Dogfall"
-                self.end_game_flag = False
             return sc2_actions.RAW_FUNCTIONS.no_op()
 
         if obs.first():
@@ -424,17 +476,6 @@ class KGGuidedAgent(SmartAgent):
                 self._initial_units_my = [(u.x, u.y) for u in unit_list_my]
                 self._initial_units_enemy = [(u.x, u.y) for u in unit_list_enemy]
                 self._initial_spawned = True
-            if self.ctx:
-                self.ctx.episode_count += 1
-                ep = self.ctx.episode_count
-                self.bridge.update_status(episode=ep)
-                self.bridge.put_event(
-                    {
-                        "level": "info",
-                        "source": "game",
-                        "message": f"Episode #{ep} 开始",
-                    }
-                )
             self._replay_frame_count = 0
 
             unit_list_my = self.get_my_units_by_type(obs, _MAP["unit_type"])

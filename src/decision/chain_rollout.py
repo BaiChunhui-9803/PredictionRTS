@@ -1,10 +1,10 @@
 """
 Chain Rollout — Beam-search-guided single-path rollout with unified tree structure.
 
-At each step, runs a beam search (via find_optimal_action) from the current
-state, mounts the full beam tree into a unified RolloutResult, selects an
-action using multi-dimensional subtree metrics, and advances.  The resulting
-tree preserves all explored branches for full traceability.
+Uses plan_action() as the unified planning entry point (from kg_beam_search).
+At each step, obtains beam search results, mounts the tree into a RolloutResult,
+selects an action, and advances.  The resulting tree preserves all explored
+branches for full traceability.
 
 Usage:
     from src.decision.chain_rollout import chain_rollout, RolloutResult
@@ -34,8 +34,9 @@ import numpy as np
 from src.decision.knowledge_graph import DecisionKnowledgeGraph
 from src.decision.kg_beam_search import (
     BeamSearchResult,
-    find_optimal_action,
+    _compute_path_composite,
     get_beam_paths,
+    plan_action,
 )
 
 
@@ -184,8 +185,6 @@ _ACTION_STRATEGIES = [
 
 _NEXT_STATE_MODES = ["sample", "highest_prob"]
 
-_COMPOSITE_WEIGHTS = (0.30, 0.30, 0.30, 0.10)
-
 
 @dataclass
 class SwitchPoint:
@@ -204,27 +203,6 @@ class PlanSegment:
     actions_planned: List[str] = field(default_factory=list)
     divergence_step: int = -1
     divergence_type: str = "none"
-
-
-def _compute_path_composite(path: List[BeamSearchResult]) -> float:
-    if not path:
-        return 0.0
-    non_root = path[1:] if len(path) > 1 else path
-    if not non_root:
-        return 1.0
-    cum_prob = path[-1].cumulative_probability
-    avg_quality = float(np.mean([r.quality_score for r in non_root]))
-    avg_win_rate = float(np.mean([r.win_rate for r in non_root]))
-    avg_reward = float(np.mean([r.avg_future_reward for r in non_root]))
-    vals = [cum_prob, avg_quality, avg_win_rate, avg_reward]
-    mn, mx = min(vals), max(vals)
-    if mx <= mn:
-        return 0.5
-    normed = [(v - mn) / (mx - mn) for v in vals]
-    w_conf, w_qual, w_wr, w_rwd = _COMPOSITE_WEIGHTS
-    return (
-        w_conf * normed[0] + w_qual * normed[1] + w_wr * normed[2] + w_rwd * normed[3]
-    )
 
 
 def _find_fork_step(
@@ -395,73 +373,6 @@ def _mount_beam_results(
     return next_id, idx_map
 
 
-def _rank_actions_from_tree(
-    result: RolloutResult,
-    current_id: int,
-    strategy: str,
-    epsilon: float,
-    rng: np.random.RandomState,
-    state_trans: Dict[str, Dict],
-) -> List[str]:
-    current = result.nodes[current_id]
-    children = [result.nodes[cid] for cid in current.children_ids]
-
-    groups: Dict[str, List[RolloutNode]] = defaultdict(list)
-    for c in children:
-        if c.action:
-            groups[c.action].append(c)
-
-    if not groups:
-        return []
-
-    action_metrics: Dict[str, Dict[str, Any]] = {}
-    for action, child_nodes in groups.items():
-        all_ids: List[int] = []
-        stack = [n.id for n in child_nodes]
-        while stack:
-            cid = stack.pop()
-            if cid in result.nodes:
-                all_ids.append(cid)
-                stack.extend(result.nodes[cid].children_ids)
-        all_nodes = [result.nodes[nid] for nid in all_ids] if all_ids else child_nodes
-
-        trans_total = 0
-        ti = state_trans.get(action, {})
-        ns = ti.get("next_states", {})
-        if ns:
-            trans_total = sum(ns.values())
-
-        action_metrics[action] = {
-            "beam_rank": min(n.beam_id for n in child_nodes if n.beam_id is not None),
-            "max_quality": max(n.quality_score for n in all_nodes),
-            "avg_win_rate": float(np.mean([n.win_rate for n in all_nodes])),
-            "avg_future_reward": float(
-                np.mean([n.avg_future_reward for n in all_nodes])
-            ),
-            "trans_total": trans_total,
-        }
-
-    items = list(action_metrics.items())
-
-    if strategy == "best_beam":
-        items.sort(key=lambda x: x[1]["beam_rank"])
-    elif strategy == "best_subtree_quality":
-        items.sort(key=lambda x: x[1]["max_quality"], reverse=True)
-    elif strategy == "best_subtree_winrate":
-        items.sort(key=lambda x: x[1]["avg_win_rate"], reverse=True)
-    elif strategy == "highest_transition_prob":
-        items.sort(key=lambda x: x[1]["trans_total"], reverse=True)
-    elif strategy == "random_beam":
-        rng.shuffle(items)
-    elif strategy == "epsilon_greedy":
-        if rng.random() < epsilon and len(items) > 1:
-            rng.shuffle(items)
-        else:
-            items.sort(key=lambda x: x[1]["beam_rank"])
-
-    return [action for action, _ in items]
-
-
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -599,7 +510,7 @@ def _chain_rollout_single_step(
             termination_reason = "终端状态"
             break
 
-        fallback_action, info = find_optimal_action(
+        plan = plan_action(
             kg,
             transitions,
             current_state,
@@ -610,13 +521,16 @@ def _chain_rollout_single_step(
             score_mode=score_mode,
             max_state_revisits=max_state_revisits,
             discount_factor=discount_factor,
+            action_strategy=action_strategy,
+            epsilon=epsilon,
+            rng_seed=None,
         )
 
-        if fallback_action is None:
+        if plan.recommended_action is None:
             termination_reason = "无可用动作"
             break
 
-        beam_results = info.get("all_results", [])
+        beam_results = plan.beam_results
 
         result.beam_results_by_step[step] = [
             {
@@ -638,9 +552,7 @@ def _chain_rollout_single_step(
             beam_results, current_id, result.nodes, next_id
         )
 
-        ordered_actions = _rank_actions_from_tree(
-            result, current_id, action_strategy, epsilon, rng, state_trans
-        )
+        ordered_actions = plan.ranked_actions
 
         if not ordered_actions:
             termination_reason = "无可用动作"
@@ -740,7 +652,7 @@ def _chain_rollout_multi_step(
             termination_reason = "终端状态"
             break
 
-        fallback_action, info = find_optimal_action(
+        plan = plan_action(
             kg,
             transitions,
             current_state,
@@ -751,13 +663,16 @@ def _chain_rollout_multi_step(
             score_mode=score_mode,
             max_state_revisits=max_state_revisits,
             discount_factor=discount_factor,
+            action_strategy=action_strategy,
+            epsilon=epsilon,
+            rng_seed=None,
         )
 
-        if fallback_action is None:
+        if plan.recommended_action is None:
             termination_reason = "无可用动作"
             break
 
-        beam_results = info.get("all_results", [])
+        beam_results = plan.beam_results
 
         result.beam_results_by_step[total_steps] = [
             {
@@ -779,13 +694,12 @@ def _chain_rollout_multi_step(
             beam_results, current_id, result.nodes, next_id
         )
 
-        all_paths = get_beam_paths(beam_results)
+        all_paths = plan.beam_paths
         if not all_paths:
             termination_reason = "无搜索路径"
             break
 
-        composites = [_compute_path_composite(p) for p in all_paths]
-        main_path_idx = int(np.argmax(composites))
+        main_path_idx = plan.best_path_index
         main_path = all_paths[main_path_idx]
 
         switching_map: Dict[int, List[SwitchPoint]] = {}

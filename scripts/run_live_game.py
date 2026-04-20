@@ -51,6 +51,14 @@ def _run_game_process(bridge, args):
         beam_params["min_cum_prob"] = args.min_cum_prob
     if args.discount_factor is not None:
         beam_params["discount_factor"] = args.discount_factor
+    if args.epsilon is not None:
+        beam_params["epsilon"] = args.epsilon
+    if args.enable_backup:
+        beam_params["enable_backup"] = True
+    if args.backup_score_threshold is not None:
+        beam_params["backup_score_threshold"] = args.backup_score_threshold
+    if args.backup_distance_threshold is not None:
+        beam_params["backup_distance_threshold"] = args.backup_distance_threshold
 
     run_game(
         map_key=args.map_key,
@@ -65,6 +73,7 @@ def _run_game_process(bridge, args):
         replay_actions=args.replay_actions.split(",") if args.replay_actions else None,
         replay_runs=args.replay_runs,
         kg_file=args.kg_file,
+        action_strategy=args.action_strategy,
     )
 
 
@@ -141,6 +150,37 @@ def main():
     )
     parser.add_argument(
         "--replay_runs", type=int, default=1, help="Number of replay runs"
+    )
+    parser.add_argument(
+        "--action_strategy",
+        default="best_beam",
+        choices=[
+            "best_beam",
+            "best_subtree_quality",
+            "best_subtree_winrate",
+            "highest_transition_prob",
+            "random_beam",
+            "epsilon_greedy",
+        ],
+        help="Action selection strategy",
+    )
+    parser.add_argument(
+        "--epsilon", type=float, default=None, help="Epsilon for epsilon_greedy"
+    )
+    parser.add_argument(
+        "--enable_backup", action="store_true", help="Enable backup path switching"
+    )
+    parser.add_argument(
+        "--backup_score_threshold",
+        type=float,
+        default=None,
+        help="Backup score threshold",
+    )
+    parser.add_argument(
+        "--backup_distance_threshold",
+        type=float,
+        default=None,
+        help="Backup distance threshold",
     )
     args = parser.parse_args()
 

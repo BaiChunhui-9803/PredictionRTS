@@ -9,7 +9,7 @@ import streamlit as st
 import numpy as np
 from src.decision.knowledge_graph import DecisionKnowledgeGraph
 from src.decision.kg_beam_search import (
-    find_optimal_action,
+    plan_action,
     get_beam_paths,
     BeamSearchResult,
 )
@@ -42,7 +42,7 @@ def _cached_beam_results(
     with open(str(KG_DIR / _trans_path), "rb") as f:
         transitions = pickle.load(f)
 
-    action, info = find_optimal_action(
+    plan = plan_action(
         kg,
         transitions,
         start_state,
@@ -55,10 +55,10 @@ def _cached_beam_results(
         discount_factor=discount_factor,
     )
 
-    if action is None:
+    if plan.recommended_action is None:
         return {"action": None}
 
-    results = info["all_results"]
+    results = plan.beam_results
 
     results_ser = [
         {
@@ -76,7 +76,7 @@ def _cached_beam_results(
         for r in results
     ]
 
-    beam_paths = get_beam_paths(results)
+    beam_paths = plan.beam_paths
     beam_paths_ser = []
     for path in beam_paths:
         beam_paths_ser.append(
@@ -96,13 +96,15 @@ def _cached_beam_results(
         )
 
     return {
-        "action": action,
+        "action": plan.recommended_action,
         "info": {
-            "expected_cumulative_reward": info["expected_cumulative_reward"],
-            "expected_win_rate": info["expected_win_rate"],
-            "best_beam_cum_prob": info["best_beam_cum_prob"],
-            "best_beam_length": info["best_beam_length"],
-            "reason": info.get("reason"),
+            "expected_cumulative_reward": plan.metrics.get(
+                "expected_cumulative_reward", 0.0
+            ),
+            "expected_win_rate": plan.metrics.get("expected_win_rate", 0.0),
+            "best_beam_cum_prob": plan.metrics.get("best_beam_cum_prob", 0.0),
+            "best_beam_length": plan.metrics.get("best_beam_length", 0),
+            "reason": plan.metrics.get("reason"),
         },
         "results": results_ser,
         "beam_paths": beam_paths_ser,

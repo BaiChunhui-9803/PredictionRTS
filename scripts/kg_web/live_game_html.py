@@ -261,6 +261,8 @@ body{font-family:'Source Sans Pro',-apple-system,sans-serif;background:var(--bg)
       </select>
       <input id="ep-search" type="text" placeholder="搜索..." style="padding:3px 8px;font-size:11px;border-radius:4px;border:1px solid var(--bd);background:var(--sf);color:var(--tx);width:80px" oninput="debounceSearch()">
       <button class="btn btn-ghost btn-sm" style="padding:3px 8px;font-size:11px" onclick="loadEpisodes()">刷新</button>
+      <input id="save-count" type="number" value="100" min="1" title="保存条数" style="width:45px;padding:3px 4px;font-size:11px;border-radius:4px;border:1px solid var(--bd);background:var(--sf);color:var(--tx);text-align:center">
+      <button class="btn btn-ghost btn-sm" style="padding:3px 8px;font-size:11px;color:#4CAF50" onclick="saveResults()">保存</button>
       <button class="btn btn-ghost btn-sm" style="padding:3px 8px;font-size:11px;color:#f44336" onclick="clearEpisodes()">清空</button>
     </div>
   </div>
@@ -592,6 +594,7 @@ var epAutoTimer=null;
 function startEpAutoRefresh(){stopEpAutoRefresh();epAutoTimer=setInterval(loadEpisodes,15000)}
 function stopEpAutoRefresh(){if(epAutoTimer){clearInterval(epAutoTimer);epAutoTimer=null}}
 async function clearEpisodes(){try{await apiPost('/game/episodes/clear');allEpisodes=[];renderEpisodes({episodes:[],total:0,page:1,per_page:epPerPage,total_pages:1});toast('对局记录已清空')}catch(e){toast('清空失败: '+e.message,false)}}
+async function saveResults(){var n=parseInt(document.getElementById('save-count').value)||100;try{var r=await apiPost('/game/results/save',{max_count:n});if(r.ok){toast('已保存 '+r.num_episodes+' 局 → '+r.filename)}else{toast('保存失败',false)}}catch(e){toast('保存失败: '+e.message,false)}}
 
 function renderEpisodes(data){
   var list=document.getElementById('episodes-list');
