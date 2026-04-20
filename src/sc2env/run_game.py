@@ -2,6 +2,7 @@ import time
 import os
 import shutil
 from datetime import datetime
+from pathlib import Path
 from absl import flags, app
 
 from pysc2.env import sc2_env, run_loop, environment
@@ -333,6 +334,11 @@ def run_game(
     fallback_action: str = "action_ATK_nearest_weakest",
     window_loc: Optional[tuple] = None,
     data_dir: Optional[str] = None,
+    autopilot_mode: str = "multi_step",
+    beam_params: Optional[dict] = None,
+    replay_actions: Optional[list] = None,
+    replay_runs: int = 1,
+    kg_file: Optional[str] = None,
 ):
     steps = _ENV_CONFIG["_MAX_STEP"]
     step_mul = _ENV_CONFIG["_STEP_MUL"]
@@ -366,36 +372,104 @@ def run_game(
 
         state_id_map = {}
         if data_dir:
-            _sn_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-                data_dir,
-                "graph",
-                "state_node.txt",
-            )
-            if not os.path.exists(_sn_path):
-                _sn_path = os.path.join(data_dir, "graph", "state_node.txt")
-            if os.path.exists(_sn_path):
-                try:
-                    with open(_sn_path, "r") as f:
-                        for line in f:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            parts = line.split("\t")
-                            if len(parts) >= 2:
-                                import ast
+            from src import ROOT_DIR
+            import ast
 
+            _sn_path = Path(data_dir) / "graph" / "state_node.txt"
+            if not _sn_path.exists():
+                _sn_path = ROOT_DIR / data_dir / "graph" / "state_node.txt"
+            if _sn_path.exists():
+                try:
+                    for line in _sn_path.read_text(encoding="utf-8").splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        parts = line.split("\t")
+                        if len(parts) >= 2:
+                            try:
                                 ps = ast.literal_eval(parts[0])
-                                nid = int(parts[1])
-                                state_id_map[(int(ps[0]), int(ps[1]))] = nid
+                                state_id_map[(int(ps[0]), int(ps[1]))] = int(parts[1])
+                            except Exception:
+                                pass
+                    print(
+                        f"[run_game] Loaded state_id_map: {len(state_id_map)} entries from {_sn_path}"
+                    )
                 except Exception as e:
-                    print(f"Warning: Failed to load state_node.txt: {e}")
+                    print(f"[run_game] Warning: Failed to load state_node.txt: {e}")
+            else:
+                print(f"[run_game] Warning: state_node.txt not found at {_sn_path}")
+
+        _kg = None
+        _transitions = None
+        _dist_matrix = None
+        if data_dir:
+            from src import ROOT_DIR as _ROOT
+            import pickle as _pickle
+
+            _kg_dir = _ROOT / "cache" / "knowledge_graph"
+            _kg_file = None
+            if kg_file:
+                _kg_file = str(_kg_dir / kg_file)
+                if not os.path.exists(_kg_file):
+                    print(
+                        f"[run_game] Warning: Specified KG file not found: {_kg_file}"
+                    )
+                    _kg_file = None
+            if _kg_file is None and _kg_dir.exists():
+                for _pkl in sorted(
+                    (p for p in _kg_dir.rglob("*.pkl") if "_transitions" not in p.name),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                ):
+                    _kg_file = str(_pkl)
+                    print(f"[run_game] Auto-discovered KG: {_kg_file}")
+                    break
+            if _kg_file:
+                try:
+                    from src.decision.knowledge_graph import DecisionKnowledgeGraph
+
+                    _kg = DecisionKnowledgeGraph.load(_kg_file)
+                    print(f"Loaded KG from {_kg_file}")
+                except Exception as e:
+                    print(f"Warning: Failed to load KG: {e}")
+            _trans_path = (
+                _kg_file.replace(".pkl", "_transitions.pkl") if _kg_file else ""
+            )
+            if _trans_path and os.path.exists(_trans_path):
+                try:
+                    with open(_trans_path, "rb") as f:
+                        _transitions = _pickle.load(f)
+                    print(f"Loaded transitions from {_trans_path}")
+                except Exception as e:
+                    print(f"Warning: Failed to load transitions: {e}")
+            _dp = Path(data_dir)
+            if len(_dp.parts) >= 2:
+                _map_id, _data_id = _dp.parts[-2], _dp.parts[-1]
+                _npy_dir = _ROOT / "cache" / "npy"
+                _dm_path = _npy_dir / f"state_distance_matrix_{_map_id}_{_data_id}.npy"
+                if _dm_path.exists():
+                    try:
+                        import numpy as _np
+
+                        _dist_matrix = _np.load(str(_dm_path))
+                        print(
+                            f"Loaded dist matrix from {_dm_path} ({_dist_matrix.shape})"
+                        )
+                    except Exception as e:
+                        print(f"Warning: Failed to load dist matrix: {e}")
 
         agent1 = KGGuidedAgent(
             bridge=bridge,
             fallback_action=fallback_action,
             initial_bktree_data=bktree_data,
             state_id_map=state_id_map,
+            kg=_kg,
+            transitions=_transitions,
+            dist_matrix=_dist_matrix,
+            mode=autopilot_mode,
+            beam_params=beam_params or {},
+            replay_actions=replay_actions,
+            replay_runs=replay_runs,
         )
     else:
         agent1 = SmartAgent()

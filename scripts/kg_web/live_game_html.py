@@ -290,7 +290,6 @@ body{font-family:'Source Sans Pro',-apple-system,sans-serif;background:var(--bg)
             <h4>来源</h4>
             <label><input type="checkbox" data-filter="source" value="game" checked onchange="applyFilters()"> GAME</label>
             <label><input type="checkbox" data-filter="source" value="api" checked onchange="applyFilters()"> API</label>
-            <label><input type="checkbox" data-filter="source" value="autopilot" checked onchange="applyFilters()"> Autopilot</label>
           </div>
           <div class="filter-group">
             <h4>消息类型</h4>
@@ -328,7 +327,7 @@ let userScrolled=false;
 const LV_COLORS={info:'lv-info',success:'lv-success',warn:'lv-warn',error:'lv-error',debug:'lv-debug'};
 const SRC_CLS={api:'src-api',game:'src-game'};
 let _filterLevels=new Set(['info','success','warn','error']);
-let _filterSources=new Set(['game','api','autopilot']);
+let _filterSources=new Set(['game','api']);
 let _filterTypes=new Set(['info','action','fallback','result','episode','control']);
 function _extractType(msg){
   if(!msg)return 'info';
@@ -356,7 +355,7 @@ function _syncSetsFromCheckboxes(){
   });
 }
 var FILTER_STORAGE_KEY='live_filter_cfg';
-var FILTER_DEFAULTS={levels:['info','success','warn','error'],sources:['game','api','autopilot'],types:['info','action','fallback','result','episode','control']};
+var FILTER_DEFAULTS={levels:['info','success','warn','error'],sources:['game','api'],types:['info','action','fallback','result','episode','control']};
 function loadFilterConfig(){
   var raw=localStorage.getItem(FILTER_STORAGE_KEY);
   if(!raw)return;
@@ -542,7 +541,7 @@ async function ctrl(cmd){try{await apiPost('/game/control',{command:cmd});toast(
 function toggleTheme(){const d=document.documentElement;d.classList.toggle('light');const isLight=d.classList.contains('light');document.getElementById('theme-btn').innerHTML=isLight?'&#9728;':'&#9790;';localStorage.setItem('live_theme',isLight?'light':'dark')}
 function loadWindowPos(){var s=localStorage.getItem('live_win_pos');if(!s)return;try{var p=JSON.parse(s);document.getElementById('win-x').value=p.x||2600;document.getElementById('win-y').value=p.y||50;document.getElementById('win-w').value=p.w||640;document.getElementById('win-h').value=p.h||480}catch(e){}}
 async function applyWindowPos(){var x=parseInt(document.getElementById('win-x').value)||50;var y=parseInt(document.getElementById('win-y').value)||50;var w=parseInt(document.getElementById('win-w').value)||640;var h=parseInt(document.getElementById('win-h').value)||480;localStorage.setItem('live_win_pos',JSON.stringify({x:x,y:y,w:w,h:h}));try{var r=await apiPost('/game/window_pos',{x:x,y:y,w:w,h:h});if(r.ok)toast('窗口位置已更新');else toast('更新失败: '+(r.error||''),false)}catch(e){toast('请求失败: '+e.message,false)}}
-async function shutdownService(){stopTimer();stopLogTimer();setConn(false);latestSeq=0;renderedMaxSeq=0;consoleBody.innerHTML='<div style="text-align:center;color:#666;padding:40px 0">等待日志...</div>';document.getElementById('log-count').textContent='0 条';document.getElementById('conn-text').textContent='已停止';try{await fetch(API+'/game/autopilot',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:false})})}catch(e){}try{await fetch(API+'/game/shutdown',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})}catch(e){}toast('服务已停止')}
+async function shutdownService(){stopTimer();stopLogTimer();setConn(false);latestSeq=0;renderedMaxSeq=0;consoleBody.innerHTML='<div style="text-align:center;color:#666;padding:40px 0">等待日志...</div>';document.getElementById('log-count').textContent='0 条';document.getElementById('conn-text').textContent='已停止';try{await fetch(API+'/game/shutdown',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})}catch(e){}toast('服务已停止')}
 
 var epCurrentPage=1,epPerPage=10,epSearchTimer=null,allEpisodes=[];
 function debounceSearch(){clearTimeout(epSearchTimer);epSearchTimer=setTimeout(function(){epCurrentPage=1;renderLocalEpisodes()},400)}
@@ -554,9 +553,6 @@ async function loadEpisodes(){
       var idx=allEpisodes.findIndex(function(e){return e.id===ep.id});
       if(idx>=0){allEpisodes[idx]=ep}else{allEpisodes.push(ep)}
     });
-    var agentIds=[];
-    newEps.forEach(function(ep){agentIds.push(ep.id)});
-    if(agentIds.length>0){try{await apiPost('/game/episodes/ack',{ids:agentIds})}catch(e){}}
     renderLocalEpisodes();
   }catch(e){}
 }
@@ -951,7 +947,6 @@ function renderPlanInline(pl,idx){
 
 async function init(){
   if(localStorage.getItem('live_theme')!=='dark'){document.documentElement.classList.add('light');document.getElementById('theme-btn').innerHTML='&#9728;'}
-  try{await refreshAutopilotStatus()}catch(e){}
   loadFilterConfig();
   loadWindowPos();
   await refresh();
@@ -959,6 +954,7 @@ async function init(){
   startLogTimer();
   fetchLogs();
   loadEpisodes();
+  startEpAutoRefresh();
 }
 init();
 </script>

@@ -36,6 +36,22 @@ def _run_game_process(bridge, args):
     if args.window_x is not None and args.window_y is not None:
         window_loc = (args.window_x, args.window_y, args.window_w, args.window_h)
 
+    beam_params = {}
+    if args.beam_width is not None:
+        beam_params["beam_width"] = args.beam_width
+    if args.lookahead_steps is not None:
+        beam_params["lookahead_steps"] = args.lookahead_steps
+    if args.score_mode is not None:
+        beam_params["score_mode"] = args.score_mode
+    if args.min_visits is not None:
+        beam_params["min_visits"] = args.min_visits
+    if args.max_state_revisits is not None:
+        beam_params["max_state_revisits"] = args.max_state_revisits
+    if args.min_cum_prob is not None:
+        beam_params["min_cum_prob"] = args.min_cum_prob
+    if args.discount_factor is not None:
+        beam_params["discount_factor"] = args.discount_factor
+
     run_game(
         map_key=args.map_key,
         run_name=args.run_name,
@@ -44,6 +60,11 @@ def _run_game_process(bridge, args):
         fallback_action=args.fallback_action,
         window_loc=window_loc,
         data_dir=args.data_dir,
+        autopilot_mode=args.autopilot_mode,
+        beam_params=beam_params,
+        replay_actions=args.replay_actions.split(",") if args.replay_actions else None,
+        replay_runs=args.replay_runs,
+        kg_file=args.kg_file,
     )
 
 
@@ -94,6 +115,33 @@ def main():
     )
     parser.add_argument("--window_w", type=int, default=640, help="SC2 window width")
     parser.add_argument("--window_h", type=int, default=480, help="SC2 window height")
+    parser.add_argument(
+        "--autopilot_mode",
+        default="multi_step",
+        choices=["single_step", "multi_step", "replay"],
+        help="Autopilot mode",
+    )
+    parser.add_argument("--beam_width", type=int, default=None, help="Beam width")
+    parser.add_argument(
+        "--lookahead_steps", type=int, default=None, help="Lookahead steps"
+    )
+    parser.add_argument("--score_mode", default=None, help="Score mode")
+    parser.add_argument("--min_visits", type=int, default=None, help="Min visits")
+    parser.add_argument(
+        "--max_state_revisits", type=int, default=None, help="Max state revisits"
+    )
+    parser.add_argument(
+        "--min_cum_prob", type=float, default=None, help="Min cumulative probability"
+    )
+    parser.add_argument(
+        "--discount_factor", type=float, default=None, help="Discount factor"
+    )
+    parser.add_argument(
+        "--replay_actions", default=None, help="Comma-separated replay action codes"
+    )
+    parser.add_argument(
+        "--replay_runs", type=int, default=1, help="Number of replay runs"
+    )
     args = parser.parse_args()
 
     if args.mode in ("game", "all") and args.kg_file is None:

@@ -8,10 +8,6 @@ Bridge Server — FastAPI 桥接服务
     GET  /game/status           → 游戏运行状态
     GET  /game/observation      → 当前游戏观测
     GET  /game/logs             → 合并日志 (game事件 + API请求)
-    POST /game/predict          → KG beam search 推理
-    POST /game/rollout          → 多步链式推演
-    POST /game/autopilot        → 开关自动决策
-    GET  /game/autopilot/status → 查询自动决策状态
     POST /game/action           → 发送动作指令
     POST /game/fallback         → 设置默认回退策略
     POST /game/control          → 控制游戏 (pause/resume/stop/step)
@@ -20,12 +16,10 @@ Bridge Server — FastAPI 桥接服务
     POST /game/stop-process     → 终止游戏子进程 (保留API)
     GET  /game/events           → SSE 游戏事件流
     GET  /game/actions          → 可用动作列表
-    GET  /game/beam_params      → 获取/更新 beam search 参数
 """
 
 from __future__ import annotations
 
-import asyncio
 import collections
 import multiprocessing
 import os
@@ -74,54 +68,6 @@ KG_DIR = ROOT_DIR / "cache" / "knowledge_graph"
 _instance: Optional["BridgeServer"] = None
 
 _MAX_LOG_BUFFER = 500
-
-
-class PredictRequest(BaseModel):
-    state: Optional[int] = None
-    beam_width: int = 3
-    max_steps: int = 3
-    min_visits: int = 1
-    min_cum_prob: float = 0.01
-    score_mode: str = "quality"
-    max_state_revisits: int = 2
-    discount_factor: float = 0.9
-
-
-class RolloutRequest(BaseModel):
-    start_state: Optional[int] = None
-    score_mode: str = "quality"
-    action_strategy: str = "best_beam"
-    next_state_mode: str = "sample"
-    beam_width: int = 3
-    lookahead_steps: int = 5
-    max_rollout_steps: int = 30
-    min_visits: int = 1
-    min_cum_prob: float = 0.01
-    max_state_revisits: int = 2
-    discount_factor: float = 0.9
-    rollout_mode: str = "single_step"
-    enable_backup: bool = False
-    epsilon: float = 0.1
-    rng_seed: Optional[int] = None
-
-
-class AutopilotRequest(BaseModel):
-    enabled: bool
-    mode: str = "single_step"
-    score_mode: str = "quality"
-    action_strategy: str = "best_beam"
-    next_state_mode: str = "sample"
-    beam_width: int = 3
-    lookahead_steps: int = 5
-    max_rollout_steps: int = 30
-    min_visits: int = 1
-    min_cum_prob: float = 0.01
-    max_state_revisits: int = 2
-    discount_factor: float = 0.9
-    enable_backup: bool = False
-    epsilon: float = 0.1
-    replay_actions: List[str] = []
-    replay_runs: int = 1
 
 
 class ActionRequest(BaseModel):
@@ -514,41 +460,11 @@ class BridgeServer:
             "map_key": "",
             "mode": "idle",
         }
-        self._beam_search_params = {
-            "beam_width": 3,
-            "max_steps": 3,
-            "min_visits": 1,
-            "min_cum_prob": 0.01,
-            "score_mode": "quality",
-            "max_state_revisits": 2,
-            "discount_factor": 0.9,
-        }
         self._log_buffer: collections.deque = collections.deque(maxlen=_MAX_LOG_BUFFER)
         self._log_seq: int = 0
 
-        self._autopilot_enabled = False
-        self._autopilot_mode = "single_step"
-        self._autopilot_params: Dict[str, Any] = {}
-        self._autopilot_task: Optional[asyncio.Task] = None
-        self._autopilot_lock = threading.Lock()
-        self._action_plan: List[str] = []
-        self._planned_states: List[int] = []
-        self._plan_idx: int = 0
-        self._autopilot_stats = {
-            "total_decisions": 0,
-            "total_replans": 0,
-            "total_divergences": 0,
-            "last_action": None,
-            "last_state": None,
-            "plan_progress": "0/0",
-        }
         self._dist_matrix: Optional[np.ndarray] = None
-        self._last_obs_state: Optional[int] = None
-        self._last_obs_game_loop: int = 0
-        self._last_plan_snap: Optional[Dict[str, Any]] = None
         self._nid_norm_states: Dict[int, dict] = {}
-
-        self._prev_end_game_flag: bool = False
 
         self._history_store: Dict[int, List[Dict[str, Any]]] = {}
         self._history_meta: Dict[int, Dict[str, Any]] = {}
@@ -805,448 +721,6 @@ class BridgeServer:
             f"Loaded {len(self._nid_norm_states)} nid norm_states for distance matching"
         )
 
-    def set_beam_params(self, **kwargs) -> None:
-        for k, v in kwargs.items():
-            if k in self._beam_search_params:
-                self._beam_search_params[k] = v
-
-    def predict(self, state_id: int, **override_params) -> Dict[str, Any]:
-        if not self.kg_loaded or self.kg is None:
-            return {"error": "KG not loaded"}
-
-        params = dict(self._beam_search_params)
-        params.update(override_params)
-
-        from src.decision.kg_beam_search import find_optimal_action
-
-        action, info = find_optimal_action(
-            self.kg,
-            self.transitions,
-            state_id,
-            beam_width=params["beam_width"],
-            max_steps=params["max_steps"],
-            min_visits=params["min_visits"],
-            min_cum_prob=params["min_cum_prob"],
-            score_mode=params["score_mode"],
-            max_state_revisits=params["max_state_revisits"],
-            discount_factor=params["discount_factor"],
-        )
-
-        return {
-            "action": action,
-            "expected_cumulative_reward": info.get("expected_cumulative_reward", 0),
-            "expected_win_rate": info.get("expected_win_rate", 0),
-            "best_beam_cum_prob": info.get("best_beam_cum_prob", 0),
-            "best_beam_length": info.get("best_beam_length", 0),
-            "reason": info.get("reason"),
-        }
-
-    def _get_plan_from_beam(
-        self, state_id: int, lookahead_steps: int
-    ) -> Tuple[Optional[str], List[str], List[int], List[Dict], List[Dict]]:
-        from src.decision.kg_beam_search import find_optimal_action, get_beam_paths
-
-        action, info = find_optimal_action(
-            self.kg,
-            self.transitions,
-            state_id,
-            beam_width=self._autopilot_params.get("beam_width", 3),
-            max_steps=lookahead_steps,
-            min_visits=self._autopilot_params.get("min_visits", 1),
-            min_cum_prob=self._autopilot_params.get("min_cum_prob", 0.01),
-            score_mode=self._autopilot_params.get("score_mode", "quality"),
-            max_state_revisits=self._autopilot_params.get("max_state_revisits", 2),
-            discount_factor=self._autopilot_params.get("discount_factor", 0.9),
-        )
-
-        all_results = info.get("all_results", [])
-        beam_dicts = []
-        for r in all_results:
-            beam_dicts.append(
-                {
-                    "step": getattr(r, "step", 0),
-                    "state": getattr(r, "state", 0),
-                    "action": getattr(r, "action", ""),
-                    "beam_id": getattr(r, "beam_id", 0),
-                    "parent_idx": getattr(r, "parent_idx", None),
-                    "cumulative_probability": getattr(r, "cumulative_probability", 0),
-                    "quality_score": getattr(r, "quality_score", 0),
-                    "win_rate": getattr(r, "win_rate", 0),
-                    "avg_step_reward": getattr(r, "avg_step_reward", 0),
-                    "avg_future_reward": getattr(r, "avg_future_reward", 0),
-                }
-            )
-
-        paths = get_beam_paths(all_results) if all_results else []
-        paths.sort(key=lambda p: p[-1].cumulative_probability, reverse=True)
-        chosen_idx = 0
-        beam_paths = []
-        for rank, path in enumerate(paths):
-            is_chosen = rank == 0
-            if is_chosen and path and len(path) > 1 and path[0].action:
-                chosen_idx = rank
-            path_steps = []
-            for node in path:
-                path_steps.append(
-                    {
-                        "state": node.state,
-                        "action": node.action or "",
-                        "cum_prob": node.cumulative_probability,
-                        "win_rate": node.win_rate,
-                    }
-                )
-            beam_paths.append(
-                {
-                    "rank": rank + 1,
-                    "chosen": is_chosen,
-                    "steps": path_steps,
-                    "cum_prob": path[-1].cumulative_probability if path else 0,
-                }
-            )
-
-        actions = [action] if action else []
-        states = [state_id]
-
-        if all_results and action:
-            best_path_nodes = paths[0] if paths else None
-            if best_path_nodes and len(best_path_nodes) > 1:
-                actions = []
-                states = []
-                for node in best_path_nodes:
-                    states.append(node.state)
-                    if node.action:
-                        actions.append(node.action)
-                if states and states[0] != state_id:
-                    states.insert(0, state_id)
-                chosen_idx = 0
-
-        first_action = actions[0] if actions else None
-        return first_action, actions, states, beam_dicts, beam_paths
-
-    def _pick_best_path(self, all_results):
-        from src.decision.kg_beam_search import get_beam_paths
-
-        try:
-            paths = get_beam_paths(all_results)
-            if not paths:
-                return None
-            paths.sort(key=lambda p: p[-1].cumulative_probability, reverse=True)
-            return paths[0]
-        except Exception:
-            return None
-
-    def _try_backup_switch(
-        self, actual_state: int, plan_position: int
-    ) -> Optional[Tuple[str, str, Dict]]:
-        snap = self._last_plan_snap
-        if not snap:
-            return None
-        sp_map = snap.get("switch_points_by_segment")
-        if not sp_map:
-            return None
-        points = sp_map.get(str(plan_position), [])
-        if not points:
-            return None
-        for sp in points:
-            if sp["predicted_state"] == actual_state:
-                result = self._apply_backup(sp, "backup_switch_exact", actual_state)
-                if result:
-                    return result
-        if self._dist_matrix is not None:
-            best = None
-            best_dist = 0.2
-            for sp in points:
-                try:
-                    d = float(self._dist_matrix[actual_state, sp["predicted_state"]])
-                    if np.isnan(d):
-                        continue
-                    if d < best_dist:
-                        best_dist = d
-                        best = sp
-                except (IndexError, TypeError):
-                    continue
-            if best is not None:
-                result = self._apply_backup(best, "backup_switch_fuzzy", actual_state)
-                if result:
-                    return result
-        return None
-
-    def _apply_backup(
-        self, sp: Dict, event_type: str, actual_state: int
-    ) -> Optional[Tuple[str, str, Dict]]:
-        remaining = sp.get("remaining_actions", [])
-        if not remaining:
-            return None
-        action = remaining[0]
-        new_actions = list(remaining)
-        new_plan_snap = {
-            "state_id": actual_state,
-            "action_plan": new_actions,
-            "planned_states": [actual_state],
-            "mode": "multi_step",
-            "trigger": "backup_switch",
-            "backup_match_type": sp.get("match_type", "unknown"),
-        }
-        self._action_plan = new_actions
-        self._planned_states = [actual_state]
-        self._plan_idx = 1
-        self._autopilot_stats["total_decisions"] += 1
-        self._autopilot_stats["total_backup_switches"] = (
-            self._autopilot_stats.get("total_backup_switches", 0) + 1
-        )
-        self._autopilot_stats["plan_progress"] = f"1/{len(new_actions)}"
-        self.add_log(
-            "info",
-            "autopilot",
-            f"备选切换({sp.get('match_type', '?')}): S{actual_state} → {action}",
-        )
-        return action, event_type, new_plan_snap
-
-    def _autopilot_decide(
-        self, state_id: int
-    ) -> Tuple[Optional[str], str, Optional[Dict]]:
-        if not self.kg_loaded or self.kg is None:
-            self.add_log("warn", "autopilot", "KG 未加载，跳过决策")
-            return None, "no_action", None
-
-        mode = self._autopilot_mode
-
-        mode = self._autopilot_mode
-        params = self._autopilot_params
-        lookahead = params.get("lookahead_steps", 5)
-
-        if mode == "single_step":
-            try:
-                first_action, actions, states, beam_dicts, beam_paths = (
-                    self._get_plan_from_beam(
-                        state_id, self._beam_search_params.get("max_steps", 3)
-                    )
-                )
-            except Exception as e:
-                self.add_log("error", "autopilot", f"推理异常: {e}")
-                return None, "fallback", None
-            action = first_action
-            self._autopilot_stats["total_decisions"] += 1
-            self._action_plan = []
-            self._planned_states = []
-            self._plan_idx = 0
-            self._autopilot_stats["plan_progress"] = "0/0"
-            plan_snap = (
-                {
-                    "state_id": state_id,
-                    "action_plan": [action] if action else [],
-                    "planned_states": [state_id],
-                    "beam_results": beam_dicts,
-                    "beam_paths": beam_paths,
-                    "mode": "single_step",
-                }
-                if action
-                else None
-            )
-            if action:
-                self._last_plan_snap = plan_snap
-            return action, "kg_plan" if action else "no_action", plan_snap
-
-        else:
-            is_diverge = False
-            if self._plan_idx < len(self._action_plan):
-                expected = (
-                    self._planned_states[self._plan_idx]
-                    if self._plan_idx < len(self._planned_states)
-                    else None
-                )
-                if expected is not None and not _states_match(
-                    state_id, expected, self._dist_matrix, 0.2
-                ):
-                    bs_result = self._try_backup_switch(state_id, self._plan_idx)
-                    if bs_result is not None:
-                        self._last_plan_snap = bs_result[2]
-                        return bs_result
-                    self._autopilot_stats["total_divergences"] += 1
-                    self.add_log(
-                        "warn",
-                        "autopilot",
-                        f"状态偏离: 预期 S{expected}, 实际 S{state_id}, 重新规划",
-                    )
-                    self._action_plan = []
-                    self._planned_states = []
-                    self._plan_idx = 0
-                    is_diverge = True
-
-            plan_snap = None
-            if self._plan_idx >= len(self._action_plan):
-                self._autopilot_stats["total_replans"] += 1
-                try:
-                    first_action, actions, states, beam_dicts, beam_paths = (
-                        self._get_plan_from_beam(state_id, lookahead)
-                    )
-                    if not actions:
-                        return None, "no_action", None
-                    self._action_plan = actions
-                    self._planned_states = states
-                    self._plan_idx = 0
-                    plan_snap = {
-                        "state_id": state_id,
-                        "action_plan": actions,
-                        "planned_states": states,
-                        "beam_results": beam_dicts,
-                        "beam_paths": beam_paths,
-                        "mode": "multi_step",
-                        "trigger": "diverge" if is_diverge else "exhausted",
-                    }
-                    self._last_plan_snap = plan_snap
-                    self.add_log(
-                        "info",
-                        "autopilot",
-                        f"新规划: {len(actions)} 步, 起点 S{state_id}"
-                        + (" (偏离触发)" if is_diverge else ""),
-                    )
-                except Exception as e:
-                    self.add_log("error", "autopilot", f"规划异常: {e}")
-                    return None, "fallback", None
-
-            action = self._action_plan[self._plan_idx]
-            if self._plan_idx == 0:
-                event_type = "diverge" if is_diverge else "kg_plan"
-            else:
-                event_type = "kg_follow"
-            self._plan_idx += 1
-            self._autopilot_stats["total_decisions"] += 1
-            self._autopilot_stats["plan_progress"] = (
-                f"{self._plan_idx}/{len(self._action_plan)}"
-            )
-            return action, event_type, plan_snap
-
-    def get_autopilot_status(self) -> Dict[str, Any]:
-        result = {
-            "enabled": self._autopilot_enabled,
-            "mode": self._autopilot_mode,
-            "plan_progress": self._autopilot_stats["plan_progress"],
-            "current_action": (
-                self._action_plan[self._plan_idx]
-                if self._plan_idx < len(self._action_plan)
-                else None
-            ),
-            "stats": dict(self._autopilot_stats),
-        }
-        if self._autopilot_mode == "replay":
-            result["replay"] = {
-                "queue_remaining": self.bridge.replay_queue.qsize(),
-            }
-        return result
-
-    def start_autopilot(self, params: Dict[str, Any]) -> None:
-        self._autopilot_params = params
-        self._autopilot_mode = params.get("mode", "single_step")
-        self._autopilot_enabled = True
-        self._action_plan = []
-        self._planned_states = []
-        self._plan_idx = 0
-        self._autopilot_stats = {
-            "total_decisions": 0,
-            "total_replans": 0,
-            "total_divergences": 0,
-            "last_action": None,
-            "last_state": None,
-            "plan_progress": "0/0",
-        }
-        self._last_obs_state = None
-        self._last_obs_game_loop = 0
-        if self._autopilot_mode == "replay":
-            actions = params.get("replay_actions", [])
-            runs = max(1, params.get("replay_runs", 1))
-            self.bridge.load_replay_actions(actions, runs)
-            self.add_log(
-                "info",
-                "replay",
-                f"回放模式: {len(actions)}步 × {runs}轮, 已加载到动作队列",
-            )
-        self._last_plan_snap = None
-        self._prev_end_game_flag = False
-        self.add_log(
-            "success", "autopilot", f"自动决策已启动 (mode={self._autopilot_mode})"
-        )
-
-    def stop_autopilot(self) -> None:
-        self._autopilot_enabled = False
-        self._action_plan = []
-        self._planned_states = []
-        self._plan_idx = 0
-        self.add_log("info", "autopilot", "自动决策已停止")
-
-    def run_rollout_sync(
-        self, start_state: int, params: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        from src.decision.chain_rollout import chain_rollout
-
-        result = chain_rollout(
-            self.kg,
-            self.transitions,
-            start_state,
-            score_mode=params.get("score_mode", "quality"),
-            action_strategy=params.get("action_strategy", "best_beam"),
-            next_state_mode=params.get("next_state_mode", "sample"),
-            beam_width=params.get("beam_width", 3),
-            lookahead_steps=params.get("lookahead_steps", 5),
-            max_rollout_steps=params.get("max_rollout_steps", 30),
-            min_visits=params.get("min_visits", 1),
-            min_cum_prob=params.get("min_cum_prob", 0.01),
-            max_state_revisits=params.get("max_state_revisits", 2),
-            discount_factor=params.get("discount_factor", 0.9),
-            rollout_mode=params.get("rollout_mode", "single_step"),
-            enable_backup=params.get("enable_backup", False),
-            epsilon=params.get("epsilon", 0.1),
-            rng_seed=params.get("rng_seed"),
-            dist_matrix=self._dist_matrix,
-        )
-
-        nodes = {}
-        for nid_str, node in result.nodes.items():
-            nodes[nid_str] = {
-                "state": node.state,
-                "action": node.action,
-                "quality_score": node.quality_score,
-                "win_rate": node.win_rate,
-                "avg_future_reward": node.avg_future_reward,
-                "avg_step_reward": node.avg_step_reward,
-                "visits": node.visits,
-                "transition_prob": node.transition_prob,
-                "cumulative_probability": node.cumulative_probability,
-                "is_terminal": node.is_terminal,
-                "is_on_chosen_path": node.is_on_chosen_path,
-            }
-
-        steps = []
-        path_ids = result.chosen_path_ids
-        for i in range(len(path_ids) - 1):
-            prev = nodes.get(str(path_ids[i]), {})
-            curr = nodes.get(str(path_ids[i + 1]), {})
-            steps.append(
-                {
-                    "step": i + 1,
-                    "state": prev.get("state"),
-                    "action": curr.get("action"),
-                    "next_state": curr.get("state"),
-                    "win_rate": curr.get("win_rate"),
-                    "quality_score": curr.get("quality_score"),
-                }
-            )
-
-        first_action = steps[0]["action"] if steps else None
-
-        return {
-            "summary": {
-                "total_steps": len(steps),
-                "termination_reason": result.termination_reason,
-                "first_action": first_action,
-                "rollout_mode": result.rollout_mode,
-                "total_re_searches": result.total_re_searches,
-                "total_backup_switches": result.total_backup_switches,
-            },
-            "steps": steps,
-            "full_nodes": nodes,
-        }
-
     def _drain_history(self) -> None:
         for ep_data in self.bridge.get_histories():
             ep_id = ep_data["episode_id"]
@@ -1255,7 +729,7 @@ class BridgeServer:
                 "result": ep_data.get("result", "Unknown"),
                 "score": ep_data.get("score", 0.0),
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "mode": self._autopilot_mode,
+                "mode": ep_data.get("mode", ""),
                 "frame_count": len(ep_data["frames"]),
             }
             self._ep_detail_cache.pop(ep_id, None)
@@ -1376,99 +850,6 @@ class BridgeServer:
             pass
 
 
-async def _autopilot_loop():
-    inst = _instance
-    if inst is None:
-        return
-    try:
-        while inst._autopilot_enabled:
-            inst._drain_history()
-            raw_events = inst.bridge.get_events()
-            if raw_events:
-                for re in raw_events:
-                    re = _enrich_event(re)
-                    level = re.get("level", "info")
-                    source = re.get("source", "game")
-                    message = re.get("message", str(re))
-                    if isinstance(message, dict):
-                        message = json.dumps(message, default=str)
-                    inst.add_log(level, source, message)
-
-            obs = inst.bridge.get_observation(timeout=0.5)
-            if obs is None:
-                await asyncio.sleep(0.1)
-                continue
-
-            status = inst._refresh_status()
-            if not status.get("running", False) or status.get("paused", False):
-                await asyncio.sleep(0.5)
-                continue
-
-            end_flag = obs.get("end_game_flag", False)
-            if end_flag and not inst._prev_end_game_flag:
-                if inst._autopilot_mode == "replay":
-                    if inst.bridge.replay_queue.empty():
-                        inst._autopilot_enabled = False
-                        inst.add_log("info", "replay", "回放完成")
-                        inst.bridge.send_control("pause")
-                        break
-                    inst.add_log("info", "replay", "Episode结束, 开始下一轮")
-                inst._last_obs_state = None
-                inst._prev_end_game_flag = True
-                await asyncio.sleep(0.01)
-                continue
-
-            if end_flag:
-                await asyncio.sleep(0.05)
-                continue
-
-            inst._prev_end_game_flag = False
-
-            state_id = _parse_state_id(obs)
-            if state_id is None:
-                await asyncio.sleep(0.1)
-                continue
-
-            game_loop = obs.get("game_loop", 0)
-
-            if inst._last_obs_state == state_id:
-                await asyncio.sleep(0.05)
-                continue
-
-            inst._last_obs_state = state_id
-
-            if inst._autopilot_mode == "replay":
-                await asyncio.sleep(0.01)
-                continue
-
-            loop = asyncio.get_event_loop()
-            action, event_type, plan_snap = await loop.run_in_executor(
-                None, inst._autopilot_decide, state_id
-            )
-
-            if plan_snap is not None:
-                plan_snap["game_loop"] = game_loop
-
-            if action is not None:
-                inst.bridge.put_action(
-                    {
-                        "action_code": action,
-                        "plan_snap": plan_snap,
-                        "event_type": event_type,
-                    }
-                )
-                inst._autopilot_stats["last_action"] = action
-                inst._autopilot_stats["last_state"] = state_id
-                inst.add_log("info", "autopilot", f"S{state_id} → {action}")
-
-            await asyncio.sleep(0.01)
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        inst.add_log("error", "autopilot", f"异常退出: {str(e)}")
-        inst._autopilot_enabled = False
-
-
 def create_app(bridge: GameBridge) -> FastAPI:
     global _instance
     _instance = BridgeServer(bridge)
@@ -1491,8 +872,6 @@ def create_app(bridge: GameBridge) -> FastAPI:
             "/game/logs",
             "/game/events",
             "/game/actions",
-            "/game/beam_params",
-            "/game/autopilot/status",
             "/game/episodes",
             "/game/episodes/clear",
         ):
@@ -1517,6 +896,7 @@ def create_app(bridge: GameBridge) -> FastAPI:
     @app.get("/game/status")
     async def get_status():
         status = _instance._refresh_status()
+        _instance._drain_history()
         status.update(_instance.history_stats())
         return status
 
@@ -1536,13 +916,12 @@ def create_app(bridge: GameBridge) -> FastAPI:
 
     @app.get("/game/observation")
     async def get_observation():
-        obs = _instance.bridge.get_observation(timeout=1.0)
-        if obs is None:
-            return {
-                "error": "no_observation",
-                "message": "No observation available. Game may not be running.",
-            }
-        return _instance._to_native(obs)
+        status = _instance._refresh_status()
+        return {
+            "my_total_hp": status.get("my_total_hp", 0),
+            "enemy_total_hp": status.get("enemy_total_hp", 0),
+            "last_action": status.get("last_action", "-"),
+        }
 
     @app.get("/game/logs")
     async def get_logs(after_seq: int = Query(0)):
@@ -1554,84 +933,6 @@ def create_app(bridge: GameBridge) -> FastAPI:
         _instance.clear_logs()
         return {"status": "cleared"}
 
-    @app.post("/game/predict")
-    async def predict(req: PredictRequest):
-        if not _instance.kg_loaded:
-            raise HTTPException(
-                status_code=400, detail="KG not loaded. Call POST /game/load_kg first."
-            )
-
-        obs = _instance.bridge.get_observation(timeout=0.1)
-        state_id = req.state
-
-        if state_id is None and obs is not None:
-            state_id = _parse_state_id(obs)
-
-        if state_id is None:
-            raise HTTPException(status_code=400, detail="Cannot determine state ID.")
-
-        result = _instance.predict(
-            state_id,
-            beam_width=req.beam_width,
-            max_steps=req.max_steps,
-            min_visits=req.min_visits,
-            min_cum_prob=req.min_cum_prob,
-            score_mode=req.score_mode,
-            max_state_revisits=req.max_state_revisits,
-            discount_factor=req.discount_factor,
-        )
-
-        if "error" in result:
-            raise HTTPException(status_code=500, detail=result["error"])
-
-        return result
-
-    @app.post("/game/rollout")
-    async def rollout(req: RolloutRequest):
-        if not _instance.kg_loaded:
-            raise HTTPException(status_code=400, detail="KG not loaded.")
-
-        start_state = req.start_state
-        if start_state is None:
-            obs = _instance.bridge.get_observation(timeout=0.5)
-            if obs is None:
-                raise HTTPException(status_code=400, detail="No observation available.")
-            start_state = _parse_state_id(obs)
-            if start_state is None:
-                raise HTTPException(
-                    status_code=400, detail="Cannot determine state ID."
-                )
-
-        params = req.model_dump(exclude={"start_state"})
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None, _instance.run_rollout_sync, start_state, params
-        )
-        return _instance._to_native(result)
-
-    @app.post("/game/autopilot")
-    async def autopilot(req: AutopilotRequest):
-        if req.enabled and req.mode != "replay":
-            if not _instance.kg_loaded:
-                raise HTTPException(status_code=400, detail="KG not loaded.")
-
-        if req.enabled:
-            if _instance._autopilot_enabled:
-                return {"status": "already_running"}
-            _instance.start_autopilot(req.model_dump(exclude={"enabled"}))
-            _instance._autopilot_task = asyncio.create_task(_autopilot_loop())
-            return {"status": "started", "mode": req.mode}
-        else:
-            if _instance._autopilot_task and not _instance._autopilot_task.done():
-                _instance._autopilot_task.cancel()
-                _instance._autopilot_task = None
-            _instance.stop_autopilot()
-            return {"status": "stopped"}
-
-    @app.get("/game/autopilot/status")
-    async def autopilot_status():
-        return _instance.get_autopilot_status()
-
     @app.get("/game/episodes")
     async def get_episodes(
         page: int = Query(1, ge=1),
@@ -1639,6 +940,7 @@ def create_app(bridge: GameBridge) -> FastAPI:
         sort: str = Query("id_desc"),
         search: Optional[str] = Query(None),
     ):
+        _instance._drain_history()
         all_eps = []
         for ep_id in sorted(_instance._history_store.keys()):
             detail = _instance._build_episode_detail(ep_id)
@@ -1753,23 +1055,6 @@ def create_app(bridge: GameBridge) -> FastAPI:
             "available_actions": FALLBACK_ACTIONS,
         }
 
-    @app.get("/game/beam_params")
-    async def get_beam_params():
-        return _instance._beam_search_params
-
-    @app.post("/game/beam_params")
-    async def set_beam_params(req: PredictRequest):
-        _instance.set_beam_params(
-            beam_width=req.beam_width,
-            max_steps=req.max_steps,
-            min_visits=req.min_visits,
-            min_cum_prob=req.min_cum_prob,
-            score_mode=req.score_mode,
-            max_state_revisits=req.max_state_revisits,
-            discount_factor=req.discount_factor,
-        )
-        return {"status": "updated", "params": _instance._beam_search_params}
-
     _FILTER_CFG_FILE = Path(
         os.environ.get(
             "LIVE_FILTER_CFG",
@@ -1781,7 +1066,7 @@ def create_app(bridge: GameBridge) -> FastAPI:
     )
     _FILTER_DEFAULTS = {
         "levels": ["info", "success", "warn", "error"],
-        "sources": ["game", "api", "autopilot"],
+        "sources": ["game", "api"],
         "types": ["info", "action", "fallback", "result", "episode", "control"],
     }
 

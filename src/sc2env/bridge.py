@@ -1,14 +1,11 @@
 """
-GameBridge — 进程间通信桥接层
+GameBridge — 进程间通信桥接层（精简版）
 
-通过 multiprocessing.Queue 实现 SC2 游戏进程与 FastAPI 桥接服务之间的双向通信。
-
-队列方向:
-    obs_queue:      Agent → API   (每帧游戏状态)
-    action_queue:   API  → Agent  (动作指令)
+游戏进程自主决策后，仅通过以下通道与 bridge_server 通信：
     event_queue:    Agent → API   (胜负/episode事件)
     control_queue:  API  → Agent  (暂停/恢复/停止)
-    status_queue:   Agent → API   (状态增量更新)
+    status_queue:   Agent → API   (状态增量更新，每N帧推送)
+    history_queue:  Agent → API   (对局记录，每N局批量推送)
 """
 
 import time
@@ -18,31 +15,14 @@ from typing import Any, Dict, List, Optional
 
 class GameBridge:
     def __init__(self):
-        self.obs_queue: Queue = Queue(maxsize=1)
-        self.action_queue: Queue = Queue(maxsize=1)
         self.event_queue: Queue = Queue()
         self.control_queue: Queue = Queue(maxsize=1)
         self.status_queue: Queue = Queue(maxsize=100)
         self._stop_event = Event()
         self._run_episode_event = Event()
         self.history_queue: Queue = Queue(maxsize=100)
-        self.replay_queue: Queue = Queue()
 
     # ---- Agent → API ----
-
-    def put_observation(self, obs_dict: Dict[str, Any]) -> None:
-        try:
-            if not self.obs_queue.empty():
-                self.obs_queue.get_nowait()
-            self.obs_queue.put_nowait(obs_dict)
-        except Exception:
-            pass
-
-    def get_observation(self, timeout: float = 0.5) -> Optional[Dict[str, Any]]:
-        try:
-            return self.obs_queue.get(timeout=timeout)
-        except Exception:
-            return None
 
     def put_event(self, event_dict: Dict[str, Any]) -> None:
         try:
@@ -76,23 +56,7 @@ class GameBridge:
             pass
         return updates
 
-    # ---- API → Agent ----
-
-    def put_action(self, payload) -> None:
-        if isinstance(payload, str):
-            payload = {"action_code": payload, "plan_snap": None}
-        try:
-            if not self.action_queue.empty():
-                self.action_queue.get_nowait()
-            self.action_queue.put_nowait(payload)
-        except Exception:
-            pass
-
-    def get_action(self, timeout: float = 0.05) -> Optional[Dict[str, Any]]:
-        try:
-            return self.action_queue.get(timeout=timeout)
-        except Exception:
-            return None
+    # ---- API → Agent (control only) ----
 
     def send_control(self, cmd: str) -> None:
         try:
@@ -156,21 +120,3 @@ class GameBridge:
         except Exception:
             pass
         return result
-
-    # ---- Replay ----
-
-    def load_replay_actions(self, actions: List[str], runs: int = 1) -> None:
-        try:
-            while not self.replay_queue.empty():
-                self.replay_queue.get_nowait()
-        except Exception:
-            pass
-        for _ in range(runs):
-            for a in actions:
-                self.replay_queue.put(a)
-
-    def get_replay_action(self) -> Optional[str]:
-        try:
-            return self.replay_queue.get_nowait()
-        except Exception:
-            return None

@@ -268,6 +268,29 @@ def _render_live_game_sidebar(kg_entry: Optional[Dict] = None):
                 str(st.session_state.get("live_wh", 480)),
             ]
         )
+
+        if live_mode == "回放重演":
+            cmd.extend(["--autopilot_mode", "replay"])
+            if replay_idx < len(ep_data["actions"]):
+                cmd.extend(
+                    [
+                        "--replay_actions",
+                        ",".join(ep_data["actions"][replay_idx]),
+                    ]
+                )
+            cmd.extend(["--replay_runs", str(replay_runs)])
+        elif live_mode == "多步推演":
+            cmd.extend(["--autopilot_mode", "multi_step"])
+        else:
+            cmd.extend(["--autopilot_mode", "single_step"])
+
+        cmd.extend(["--beam_width", str(st.session_state.get("live_bw", 3))])
+        cmd.extend(["--lookahead_steps", str(st.session_state.get("live_la", 5))])
+        cmd.extend(["--score_mode", st.session_state.get("live_sm", "quality")])
+        cmd.extend(["--min_visits", str(st.session_state.get("live_mv", 1))])
+        cmd.extend(["--max_state_revisits", str(st.session_state.get("live_msr", 2))])
+        cmd.extend(["--min_cum_prob", str(st.session_state.get("live_mcp", 0.01))])
+        cmd.extend(["--discount_factor", str(st.session_state.get("live_df", 0.9))])
         p = subprocess.Popen(
             cmd,
             cwd=str(ROOT_DIR),
@@ -276,91 +299,24 @@ def _render_live_game_sidebar(kg_entry: Optional[Dict] = None):
             else 0,
         )
         st.session_state.live_proc = p
-        _beam_params = {
-            "beam_width": st.session_state.get("live_bw", 3),
-            "max_steps": st.session_state.get("live_mrs", 50),
-            "score_mode": st.session_state.get("live_sm", "quality"),
-            "min_visits": st.session_state.get("live_mv", 1),
-            "min_cum_prob": st.session_state.get("live_mcp", 0.01),
-            "max_state_revisits": st.session_state.get("live_msr", 2),
-            "discount_factor": st.session_state.get("live_df", 0.9),
-        }
-        _ap_payload = {"enabled": True}
-        if live_mode == "回放重演":
-            _ap_payload["mode"] = "replay"
-            _ap_payload["replay_actions"] = (
-                ep_data["actions"][replay_idx]
-                if replay_idx < len(ep_data["actions"])
-                else []
-            )
-            _ap_payload["replay_runs"] = replay_runs
-        else:
-            _ap_payload["mode"] = (
-                "single_step" if live_mode == "单步推演" else "multi_step"
-            )
-            _ap_payload["lookahead_steps"] = st.session_state.get("live_la", 5)
-            _ap_payload["action_strategy"] = st.session_state.get(
-                "live_as", "best_beam"
-            )
-            _ap_payload["score_mode"] = st.session_state.get("live_sm", "quality")
-            _ap_payload["beam_width"] = st.session_state.get("live_bw", 3)
-            _ap_payload["max_steps"] = st.session_state.get("live_mrs", 50)
-            _ap_payload["min_visits"] = st.session_state.get("live_mv", 1)
-            _ap_payload["min_cum_prob"] = st.session_state.get("live_mcp", 0.01)
-            _ap_payload["max_state_revisits"] = st.session_state.get("live_msr", 2)
-            _ap_payload["discount_factor"] = st.session_state.get("live_df", 0.9)
-            _ap_payload["enable_backup"] = live_backup
-            _ap_payload["epsilon"] = st.session_state.get("live_eps", 0.1)
         with st.spinner("等待服务启动..."):
             for _ in range(30):
                 time.sleep(0.5)
                 try:
                     r = requests.get(f"{api_base}/game/status", timeout=2)
                     if r.status_code == 200:
-                        if live_mode != "回放重演":
-                            requests.post(
-                                f"{api_base}/game/beam_params",
-                                json=_beam_params,
-                                timeout=5,
-                            )
-                        requests.post(
-                            f"{api_base}/game/autopilot",
-                            json=_ap_payload,
-                            timeout=5,
-                        )
                         if start_paused:
                             requests.post(
                                 f"{api_base}/game/control",
                                 json={"command": "pause"},
                                 timeout=5,
                             )
-                        st.success(
-                            "服务已启动，自动决策已开启"
-                            + (" (已暂停)" if start_paused else "")
-                        )
+                        st.success("服务已启动" + (" (已暂停)" if start_paused else ""))
                         break
                 except Exception:
                     continue
             else:
                 st.warning("服务启动超时，请检查日志")
-
-    try:
-        r = requests.get(f"{api_base}/game/autopilot/status", timeout=2)
-        if r.status_code == 200:
-            data = r.json()
-            if data.get("enabled"):
-                stats = data.get("stats", {})
-                st.markdown(
-                    f"**运行中** | {data.get('mode', '')} | "
-                    f"决策:{stats.get('total_decisions', 0)} | "
-                    f"重规划:{stats.get('total_replans', 0)} | "
-                    f"偏离:{stats.get('total_divergences', 0)} | "
-                    f"{data.get('plan_progress', '0/0')}"
-                )
-            else:
-                st.caption("待机")
-    except Exception:
-        pass
 
 
 def _get_bridge_host():
