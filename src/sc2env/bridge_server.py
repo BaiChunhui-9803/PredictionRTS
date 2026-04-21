@@ -769,7 +769,8 @@ class BridgeServer:
         for fr in frames:
             nid = fr.get("nid")
             if nid is None:
-                nid = fr.get("state_cluster", (0, 0))
+                sc = fr.get("state_cluster", (0, 0))
+                nid = f"M({sc[0]},{sc[1]})"
             markov_flow.append([nid, fr.get("action_code", fr.get("action", ""))])
             events_list.append(
                 {

@@ -162,6 +162,7 @@ class KGGuidedAgent(SmartAgent):
         if not hasattr(self, "_mode"):
             return
         self._replay_frame_count = 0
+        self._prev_end_game_flag = False
         if self._mode == "replay" and self._replay_actions:
             if self._ep_history:
                 self._ep_counter += 1
@@ -492,12 +493,7 @@ class KGGuidedAgent(SmartAgent):
         my_units = self.get_my_units_by_type(obs, _MAP["unit_type"])
         enemy_units = self.get_enemy_units_by_type(obs, _MAP["unit_type"])
 
-        if (
-            not self._termination_signaled
-            and len(enemy_units) == 0
-            and obs.observation["score_cumulative"][5]
-            == obs.observation["score_cumulative"][3]
-        ):
+        if not self._termination_signaled and len(enemy_units) == 0:
             self.end_game_state = "Win"
             self.end_game_flag = True
             self._termination_signaled = True
@@ -606,7 +602,7 @@ class KGGuidedAgent(SmartAgent):
         self._last_action_executed = action_to_execute
         self._record_action(state_cluster, action_to_execute, action_source)
 
-        if not (
+        if (my_units or enemy_units) and not (
             self._mode == "replay"
             and self._replay_per_ep > 0
             and self._replay_frame_count >= self._replay_per_ep
