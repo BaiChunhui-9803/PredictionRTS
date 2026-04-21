@@ -163,6 +163,9 @@ class KGGuidedAgent(SmartAgent):
             return
         self._replay_frame_count = 0
         self._prev_end_game_flag = False
+        self._action_plan = []
+        self._planned_states = []
+        self._plan_idx = 0
         if self._mode == "replay" and self._replay_actions:
             if self._ep_history:
                 self._ep_counter += 1
