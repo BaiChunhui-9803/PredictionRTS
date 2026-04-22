@@ -104,6 +104,7 @@ def _render_live_game_sidebar(kg_entry: Optional[Dict] = None):
     mode_options = ["单步推演", "多步推演"]
     if has_replay:
         mode_options.append("回放重演")
+        mode_options.append("数据增强（批量回放重演）")
     st.markdown("**推演模式**")
     live_mode = st.radio(
         "mode",
@@ -130,8 +131,55 @@ def _render_live_game_sidebar(kg_entry: Optional[Dict] = None):
         )
         replay_runs = st.slider("执行次数", 1, 50, 1, key="live_replay_runs")
 
+    batch_start = 0
+    batch_end = 0
+    replay_count = 3
+    primary_threshold = 1.0
+    secondary_threshold = 0.5
+    if live_mode == "数据增强（批量回放重演）" and has_replay:
+        n_ep_batch = ep_data["n_episodes"]
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            batch_start = st.number_input(
+                "起始 Episode", 0, n_ep_batch - 1, 0, key="live_batch_start"
+            )
+        with c2:
+            batch_end = st.number_input(
+                "结束 Episode",
+                batch_start,
+                n_ep_batch - 1,
+                min(n_ep_batch - 1, batch_start + 99),
+                key="live_batch_end",
+            )
+        with c3:
+            replay_count = st.slider("每条重复次数", 1, 10, 3, key="live_replay_count")
+        total_eps = (batch_end - batch_start + 1) * replay_count
+        st.caption(f"预计生成 {total_eps} 条 episode")
+
+        tc1, tc2 = st.columns(2)
+        with tc1:
+            primary_threshold = st.number_input(
+                "主聚类阈值 (primary)",
+                0.1,
+                5.0,
+                1.0,
+                0.1,
+                key="live_primary_thresh",
+                help="坐标分布距离阈值。越小聚类越细、cluster 数越多；越大聚类越粗",
+            )
+        with tc2:
+            secondary_threshold = st.number_input(
+                "子聚类阈值 (secondary)",
+                0.1,
+                3.0,
+                0.5,
+                0.1,
+                key="live_secondary_thresh",
+                help="生命值差异阈值。越小对 HP 变化越敏感",
+            )
+
     live_backup = False
-    if live_mode != "回放重演":
+    if live_mode not in ("回放重演", "数据增强（批量回放重演）"):
         st.subheader("Beam Search 参数")
 
         c1, c2 = st.columns(2)
@@ -279,20 +327,32 @@ def _render_live_game_sidebar(kg_entry: Optional[Dict] = None):
                     ]
                 )
             cmd.extend(["--replay_runs", str(replay_runs)])
+        elif live_mode == "数据增强（批量回放重演）":
+            cmd.extend(["--autopilot_mode", "batch_replay"])
+            cmd.extend(["--batch_start", str(batch_start)])
+            cmd.extend(["--batch_end", str(batch_end)])
+            cmd.extend(["--replay_count", str(replay_count)])
+            cmd.extend(["--primary_threshold", str(primary_threshold)])
+            cmd.extend(["--secondary_threshold", str(secondary_threshold)])
         elif live_mode == "多步推演":
             cmd.extend(["--autopilot_mode", "multi_step"])
         else:
             cmd.extend(["--autopilot_mode", "single_step"])
 
-        cmd.extend(["--beam_width", str(st.session_state.get("live_bw", 3))])
-        cmd.extend(["--lookahead_steps", str(st.session_state.get("live_la", 5))])
-        cmd.extend(["--score_mode", st.session_state.get("live_sm", "quality")])
-        cmd.extend(["--min_visits", str(st.session_state.get("live_mv", 1))])
-        cmd.extend(["--max_state_revisits", str(st.session_state.get("live_msr", 2))])
-        cmd.extend(["--min_cum_prob", str(st.session_state.get("live_mcp", 0.01))])
-        cmd.extend(["--discount_factor", str(st.session_state.get("live_df", 0.9))])
-        cmd.extend(["--action_strategy", st.session_state.get("live_as", "best_beam")])
-        cmd.extend(["--epsilon", str(st.session_state.get("live_eps", 0.1))])
+        if live_mode not in ("回放重演", "数据增强（批量回放重演）"):
+            cmd.extend(["--beam_width", str(st.session_state.get("live_bw", 3))])
+            cmd.extend(["--lookahead_steps", str(st.session_state.get("live_la", 5))])
+            cmd.extend(["--score_mode", st.session_state.get("live_sm", "quality")])
+            cmd.extend(["--min_visits", str(st.session_state.get("live_mv", 1))])
+            cmd.extend(
+                ["--max_state_revisits", str(st.session_state.get("live_msr", 2))]
+            )
+            cmd.extend(["--min_cum_prob", str(st.session_state.get("live_mcp", 0.01))])
+            cmd.extend(["--discount_factor", str(st.session_state.get("live_df", 0.9))])
+            cmd.extend(
+                ["--action_strategy", st.session_state.get("live_as", "best_beam")]
+            )
+            cmd.extend(["--epsilon", str(st.session_state.get("live_eps", 0.1))])
         if live_backup:
             cmd.append("--enable_backup")
             cmd.extend(

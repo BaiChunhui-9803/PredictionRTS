@@ -60,11 +60,15 @@ def _run_game_process(bridge, args):
     if args.backup_distance_threshold is not None:
         beam_params["backup_distance_threshold"] = args.backup_distance_threshold
 
+    agent_type = (
+        "batch_replay" if args.autopilot_mode == "batch_replay" else "kg_guided"
+    )
+
     run_game(
         map_key=args.map_key,
         run_name=args.run_name,
         bridge=bridge,
-        agent_type="kg_guided",
+        agent_type=agent_type,
         fallback_action=args.fallback_action,
         window_loc=window_loc,
         data_dir=args.data_dir,
@@ -74,6 +78,11 @@ def _run_game_process(bridge, args):
         replay_runs=args.replay_runs,
         kg_file=args.kg_file,
         action_strategy=args.action_strategy,
+        batch_replay_count=args.replay_count,
+        batch_start=args.batch_start,
+        batch_end=args.batch_end,
+        primary_threshold=args.primary_threshold,
+        secondary_threshold=args.secondary_threshold,
     )
 
 
@@ -127,7 +136,7 @@ def main():
     parser.add_argument(
         "--autopilot_mode",
         default="multi_step",
-        choices=["single_step", "multi_step", "replay"],
+        choices=["single_step", "multi_step", "replay", "batch_replay"],
         help="Autopilot mode",
     )
     parser.add_argument("--beam_width", type=int, default=None, help="Beam width")
@@ -144,12 +153,6 @@ def main():
     )
     parser.add_argument(
         "--discount_factor", type=float, default=None, help="Discount factor"
-    )
-    parser.add_argument(
-        "--replay_actions", default=None, help="Comma-separated replay action codes"
-    )
-    parser.add_argument(
-        "--replay_runs", type=int, default=1, help="Number of replay runs"
     )
     parser.add_argument(
         "--action_strategy",
@@ -181,6 +184,36 @@ def main():
         type=float,
         default=None,
         help="Backup distance threshold",
+    )
+    parser.add_argument(
+        "--replay_actions", default=None, help="Comma-separated replay action codes"
+    )
+    parser.add_argument(
+        "--replay_runs", type=int, default=1, help="Number of replay runs"
+    )
+    parser.add_argument(
+        "--replay_count",
+        type=int,
+        default=3,
+        help="Repeats per sequence (batch replay)",
+    )
+    parser.add_argument(
+        "--batch_start", type=int, default=0, help="Batch replay start index"
+    )
+    parser.add_argument(
+        "--batch_end", type=int, default=None, help="Batch replay end index"
+    )
+    parser.add_argument(
+        "--primary_threshold",
+        type=float,
+        default=1.0,
+        help="BKTree primary cluster threshold (default: 1.0)",
+    )
+    parser.add_argument(
+        "--secondary_threshold",
+        type=float,
+        default=0.5,
+        help="BKTree secondary cluster threshold (default: 0.5)",
     )
     args = parser.parse_args()
 

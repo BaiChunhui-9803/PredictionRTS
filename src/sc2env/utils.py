@@ -9,15 +9,16 @@ from .config import get_map_config
 
 _MAP_CONFIG, _MAP, _ENV_CONFIG, _ALG_CONFIG, _PATH_CONFIG = get_map_config("sce-1")
 
+
 class GameContext:
     def __init__(self):
-        self.episode_count = 1
+        self.episode_count = 0
         self.node_dict = {}
         self.episode_node_list = []
 
 
 def init_game(ctx, path_config):
-    ctx.episode_count = 1
+    ctx.episode_count = 0
     ctx.node_dict = {}
     ctx.episode_node_list = []
 

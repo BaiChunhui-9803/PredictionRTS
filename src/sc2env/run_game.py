@@ -247,15 +247,24 @@ def run_loop_custom(
                         timesteps = env.step(agent_actions, 2)
                         env.total_episodes += 1
                         if bridge:
+                            ep_num = (
+                                getattr(
+                                    agents[0].ctx, "episode_count", env.total_episodes
+                                )
+                                if hasattr(agents[0], "ctx") and agents[0].ctx
+                                else env.total_episodes
+                            )
                             bridge.put_event(
                                 {
                                     "level": "success"
                                     if result_str == "win"
                                     else "error",
                                     "source": "game",
-                                    "message": f"判定 {result_str.upper()}, 得分: {score_val:+d} (我方{my_hp} vs 敌方{enemy_hp})",
+                                    "message": f"Episode #{ep_num} 判定 {result_str.upper()}, 得分: {score_val:+d} (我方{my_hp} vs 敌方{enemy_hp})",
                                 }
                             )
+                        if getattr(agents[0], "_done", False):
+                            break
                         continue
                     except Exception as e:
                         if bridge:
@@ -285,6 +294,7 @@ def run_loop_custom(
                                 bridge.update_status(running=False, mode="stopped")
                                 return
                             continue
+                        agents[0].end_game_state = "Dogfall"
                         agents[0].new_game()
                         agents[0].end_game_frames = (
                             _ENV_CONFIG["_MAX_STEP"] * _ENV_CONFIG["_STEP_MUL"]
@@ -299,6 +309,21 @@ def run_loop_custom(
                     spawn_units(env, agents[0])
                     timesteps = env.step(agent_actions, 2)
                     env.total_episodes += 1
+                    if bridge:
+                        ep_num = (
+                            getattr(agents[0].ctx, "episode_count", env.total_episodes)
+                            if hasattr(agents[0], "ctx") and agents[0].ctx
+                            else env.total_episodes
+                        )
+                        bridge.put_event(
+                            {
+                                "level": "warn",
+                                "source": "game",
+                                "message": f"Episode #{ep_num} 结束: Dogfall (超时, frame={total_frames})",
+                            }
+                        )
+                    if getattr(agents[0], "_done", False):
+                        break
                     continue
                 if max_frames and total_frames >= max_frames:
                     if bridge:
@@ -340,12 +365,34 @@ def run_game(
     replay_runs: int = 1,
     kg_file: Optional[str] = None,
     action_strategy: str = "best_beam",
+    batch_replay_count: int = 3,
+    batch_start: int = 0,
+    batch_end: Optional[int] = None,
+    batch_output_dir: Optional[str] = None,
+    primary_threshold: float = 1.0,
+    secondary_threshold: float = 0.5,
 ):
     steps = _ENV_CONFIG["_MAX_STEP"]
     step_mul = _ENV_CONFIG["_STEP_MUL"]
 
     agent1 = None
-    if agent_type == "kg_guided" and bridge is not None:
+    if agent_type == "batch_replay":
+        from src.sc2env.replay_collector import ReplayCollector
+
+        action_log_path = ""
+        if data_dir:
+            action_log_path = os.path.join(data_dir, "action_log.csv")
+        agent1 = ReplayCollector(
+            bridge=bridge,
+            action_log_path=action_log_path,
+            replay_count=batch_replay_count,
+            batch_start=batch_start,
+            batch_end=batch_end,
+            output_dir=batch_output_dir,
+            primary_threshold=primary_threshold,
+            secondary_threshold=secondary_threshold,
+        )
+    elif agent_type == "kg_guided" and bridge is not None:
         from src.sc2env.kg_guided_agent import KGGuidedAgent
 
         bktree_data = None

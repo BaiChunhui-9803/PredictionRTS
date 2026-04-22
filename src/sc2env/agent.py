@@ -1408,18 +1408,6 @@ class SmartAgent(Agent):
                 self._initial_units_enemy = [(u.x, u.y) for u in unit_list_enemy]
                 self._initial_spawned = True
             if not TEST_FLAG:
-                self.ctx.episode_count += 1
-            unit_list_my = self.get_my_units_by_type(obs, _MAP["unit_type"])
-            unit_list_enemy = self.get_enemy_units_by_type(obs, _MAP["unit_type"])
-            self.score_attack_max = sum([item["health"] for item in unit_list_enemy])
-            self.score_defense_max = sum([item["health"] for item in unit_list_my])
-            self.score_cumulative_attack_last = sum(
-                [item["health"] for item in unit_list_enemy]
-            )
-            self.score_cumulative_defense_last = sum(
-                [item["health"] for item in unit_list_my]
-            )
-            if not TEST_FLAG:
                 unit_list_both = unit_list_my + unit_list_enemy
                 dataframe = pd.DataFrame(data=unit_list_both)
                 dataframe.to_csv(

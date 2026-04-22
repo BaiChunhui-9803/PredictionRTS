@@ -83,7 +83,6 @@ class KGGuidedAgent(SmartAgent):
         self._bktree_loaded = False
         self._state_id_map = state_id_map or {}
         self._ep_history: List[Dict[str, Any]] = []
-        self._ep_counter: int = 0
         self._prev_end_game_flag: bool = False
 
         self.kg = kg
@@ -170,12 +169,31 @@ class KGGuidedAgent(SmartAgent):
         self._plan_idx = 0
         self._all_beam_states = set()
         self._backup_continuations = {}
-        if self._mode == "replay" and self._replay_actions:
-            if self._ep_history:
-                self._ep_counter += 1
+
+        if not (self._mode == "replay" and self._replay_actions):
+            if not self._prev_end_game_flag and self._ep_history:
+                if hasattr(self, "ctx") and self.ctx:
+                    self.ctx.episode_count += 1
+                ep_id = self.ctx.episode_count if self.ctx else 0
                 self._ep_batch.append(
                     {
-                        "episode_id": self._ep_counter,
+                        "episode_id": ep_id,
+                        "frames": list(self._ep_history),
+                        "result": self.end_game_state or "Dogfall",
+                        "score": 0,
+                    }
+                )
+                self._ep_history = []
+                self._flush_ep_batch()
+            elif self._prev_end_game_flag and self._ep_history:
+                self._ep_history = []
+
+        if self._mode == "replay" and self._replay_actions:
+            if self._ep_history:
+                ep_id = self.ctx.episode_count if self.ctx else 0
+                self._ep_batch.append(
+                    {
+                        "episode_id": ep_id,
                         "frames": list(self._ep_history),
                         "result": self.end_game_state or "Dogfall",
                         "score": 0,
@@ -192,7 +210,6 @@ class KGGuidedAgent(SmartAgent):
                 self._replay_idx = len(self._replay_actions)
 
         if hasattr(self, "ctx") and self.ctx:
-            self.ctx.episode_count += 1
             ep = self.ctx.episode_count
             self.bridge.update_status(
                 episode=ep,
@@ -532,10 +549,12 @@ class KGGuidedAgent(SmartAgent):
             )
             self.bridge.update_status(result=self.end_game_state)
             if self._ep_history:
-                self._ep_counter += 1
+                if self.ctx:
+                    self.ctx.episode_count += 1
+                ep_id = self.ctx.episode_count if self.ctx else 0
                 self._ep_batch.append(
                     {
-                        "episode_id": self._ep_counter,
+                        "episode_id": ep_id,
                         "frames": list(self._ep_history),
                         "result": self.end_game_state or "Dogfall",
                         "score": 0,
@@ -713,10 +732,12 @@ class KGGuidedAgent(SmartAgent):
         end_flag = self.end_game_flag
         if end_flag and not self._prev_end_game_flag:
             if self._ep_history:
-                self._ep_counter += 1
+                if self.ctx:
+                    self.ctx.episode_count += 1
+                ep_id = self.ctx.episode_count if self.ctx else 0
                 self._ep_batch.append(
                     {
-                        "episode_id": self._ep_counter,
+                        "episode_id": ep_id,
                         "frames": list(self._ep_history),
                         "result": self.end_game_state,
                         "score": float(hp_my - hp_enemy),
