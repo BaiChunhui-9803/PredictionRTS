@@ -191,11 +191,9 @@ def build_episodes_arrays(
 
             action_code = frame.get("action_code", "")
             if action_code and len(action_code) >= 2:
-                letter = action_code[1].lower()
-                action_name = ACTION_MAP.get(letter, "do_nothing")
+                actions.append(action_code)
             else:
-                action_name = "do_nothing"
-            actions.append(action_name)
+                actions.append("4k")
 
             current_score = float(frame.get("hp_my", 0)) - float(
                 frame.get("hp_enemy", 0)
@@ -237,7 +235,7 @@ def build_transitions(
 
         for t in range(len(states) - 1):
             state = states[t]
-            action = actions[t] if t < len(actions) else "do_nothing"
+            action = actions[t] if t < len(actions) else "4k"
             next_state = states[t + 1]
 
             if action not in transitions[state]:
