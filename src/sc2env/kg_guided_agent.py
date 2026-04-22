@@ -10,7 +10,7 @@ KGGuidedAgent — 基于 Experience Transition Graph 引导的实时决策 Agent
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -103,6 +103,8 @@ class KGGuidedAgent(SmartAgent):
         self._planned_states: List[int] = []
         self._plan_idx: int = 0
         self._last_plan_snap: Optional[Dict] = None
+        self._all_beam_states: Set[int] = set()
+        self._backup_continuations: Dict[int, Tuple[List[str], List[int]]] = {}
 
         self._ep_batch: List[Dict[str, Any]] = []
         self._ep_push_batch_size: int = 5
@@ -166,6 +168,8 @@ class KGGuidedAgent(SmartAgent):
         self._action_plan = []
         self._planned_states = []
         self._plan_idx = 0
+        self._all_beam_states = set()
+        self._backup_continuations = {}
         if self._mode == "replay" and self._replay_actions:
             if self._ep_history:
                 self._ep_counter += 1
@@ -301,6 +305,8 @@ class KGGuidedAgent(SmartAgent):
         )
 
         if plan.recommended_action is None:
+            self._all_beam_states = set()
+            self._backup_continuations = {}
             return None, [], [], [], []
 
         beam_dicts = []
@@ -319,6 +325,34 @@ class KGGuidedAgent(SmartAgent):
                     "avg_future_reward": getattr(r, "avg_future_reward", 0),
                 }
             )
+
+        all_beam_states = set()
+        for path in plan.beam_paths:
+            for node in path:
+                all_beam_states.add(node.state)
+
+        backup_continuations = {}
+        for rank, path in enumerate(plan.beam_paths):
+            if rank == plan.best_path_index:
+                continue
+            for i in range(len(path) - 1):
+                src_state = path[i].state
+                if src_state in backup_continuations:
+                    continue
+                remaining_actions = []
+                remaining_states = [src_state]
+                for j in range(i + 1, len(path)):
+                    remaining_states.append(path[j].state)
+                    if path[j].action:
+                        remaining_actions.append(path[j].action)
+                if remaining_actions:
+                    backup_continuations[src_state] = (
+                        remaining_actions,
+                        remaining_states,
+                    )
+
+        self._all_beam_states = all_beam_states
+        self._backup_continuations = backup_continuations
 
         beam_paths = []
         for rank, path in enumerate(plan.beam_paths):
@@ -360,6 +394,8 @@ class KGGuidedAgent(SmartAgent):
             self._plan_idx = 0
 
         lookahead = self._beam_params.get("lookahead_steps", 5)
+        enable_backup = self._beam_params.get("enable_backup", False)
+        backup_dist_threshold = self._beam_params.get("backup_distance_threshold", 0.2)
         is_diverge = False
 
         if self._plan_idx < len(self._action_plan):
@@ -368,13 +404,51 @@ class KGGuidedAgent(SmartAgent):
                 if self._plan_idx < len(self._planned_states)
                 else None
             )
-            if expected is not None and not _states_match(
-                state_id, expected, self._dist_matrix, 0.2
+
+            if expected is not None and state_id == expected:
+                action = self._action_plan[self._plan_idx]
+                self._plan_idx += 1
+                return action, "kg_follow", self._last_plan_snap
+
+            is_diverge = True
+
+            if (
+                enable_backup
+                and self._all_beam_states
+                and state_id in self._all_beam_states
             ):
-                is_diverge = True
-                self._action_plan = []
-                self._planned_states = []
-                self._plan_idx = 0
+                if state_id in self._backup_continuations:
+                    actions, states = self._backup_continuations[state_id]
+                    self._action_plan = list(actions)
+                    self._planned_states = list(states)
+                    self._plan_idx = 1
+                    return actions[0], "backup_switch_exact", self._last_plan_snap
+
+                best_backup_state = None
+                best_backup_dist = float("inf")
+                for bs in self._backup_continuations:
+                    if self._dist_matrix is not None and state_id != bs:
+                        try:
+                            d = float(self._dist_matrix[state_id, bs])
+                            if not np.isnan(d) and d < best_backup_dist:
+                                best_backup_dist = d
+                                best_backup_state = bs
+                        except (IndexError, TypeError):
+                            pass
+
+                if (
+                    best_backup_state is not None
+                    and best_backup_dist < backup_dist_threshold
+                ):
+                    actions, states = self._backup_continuations[best_backup_state]
+                    self._action_plan = list(actions)
+                    self._planned_states = list(states)
+                    self._plan_idx = 1
+                    return actions[0], "backup_switch_fuzzy", self._last_plan_snap
+
+            self._action_plan = []
+            self._planned_states = []
+            self._plan_idx = 0
 
         if self._plan_idx >= len(self._action_plan):
             try:
