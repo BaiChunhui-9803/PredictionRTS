@@ -56,7 +56,7 @@ def get_map_config(map_key):
         "_MAX_EPISODE": 8000,
         "_RUNNER": 10,
         "_RESET_FRAMES": 200,
-        "_MAX_STEP": 0
+        "_MAX_STEP": 0,
     }
 
     # _ENV_CONFIG["_MAX_STEP"] = 250 / _ENV_CONFIG["_STEP_MUL"] * _MAP["unit_scale"] / 4
@@ -92,6 +92,9 @@ def get_map_config(map_key):
         "_GAME_BKTREE_PATH": "datas/data_for_transit/bktree",
         "_GAME_PRIMARY_BKTREE_PATH": "datas/data_for_transit/bktree/primary_bktree.json",
         "_GAME_SECONDARY_BKTREE_PREFIX": "datas/data_for_transit/bktree/secondary_bktree",
+        "_GAME_AUGMENTED_BKTREE_PATH": "datas/data_for_transit/bktree_augmented/primary_bktree.json",
+        "_GAME_AUGMENTED_SECONDARY_PREFIX": "datas/data_for_transit/bktree_augmented/secondary_bktree",
+        "_GAME_AUGMENTED_STATE_NODE_PATH": "datas/data_for_transit/graph/state_node_augmented.txt",
     }
 
     return _MAP_CONFIG, _MAP, _ENV_CONFIG, _ALG_CONFIG, _PATH_CONFIG

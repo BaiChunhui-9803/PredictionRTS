@@ -397,6 +397,10 @@ def run_game(
 
         bktree_data = None
         primary_bktree_path = _PATH_CONFIG.get("_GAME_PRIMARY_BKTREE_PATH", "")
+        aug_primary_path = _PATH_CONFIG.get("_GAME_AUGMENTED_BKTREE_PATH", "")
+        if not (primary_bktree_path and os.path.exists(primary_bktree_path)):
+            if aug_primary_path and os.path.exists(aug_primary_path):
+                primary_bktree_path = aug_primary_path
         if primary_bktree_path and os.path.exists(primary_bktree_path):
             try:
                 import json
@@ -405,6 +409,9 @@ def run_game(
                 with open(primary_bktree_path, "r") as f:
                     bktree_data["primary"] = json.load(f)
                 prefix = _PATH_CONFIG.get("_GAME_SECONDARY_BKTREE_PREFIX", "")
+                aug_prefix = _PATH_CONFIG.get("_GAME_AUGMENTED_SECONDARY_PREFIX", "")
+                if not (prefix and os.path.exists(f"{prefix}_1.json")):
+                    prefix = aug_prefix
                 if prefix:
                     import glob as _glob
 
@@ -415,6 +422,7 @@ def run_game(
                                 bktree_data["secondary"][cid_str] = json.load(sf)
                         except Exception:
                             pass
+                print(f"[run_game] Loaded BKTree from {primary_bktree_path}")
             except Exception as e:
                 print(f"Warning: Failed to load BKTree data: {e}")
 
@@ -426,26 +434,33 @@ def run_game(
             _sn_path = Path(data_dir) / "graph" / "state_node.txt"
             if not _sn_path.exists():
                 _sn_path = ROOT_DIR / data_dir / "graph" / "state_node.txt"
-            if _sn_path.exists():
-                try:
-                    for line in _sn_path.read_text(encoding="utf-8").splitlines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        parts = line.split("\t")
-                        if len(parts) >= 2:
-                            try:
-                                ps = ast.literal_eval(parts[0])
-                                state_id_map[(int(ps[0]), int(ps[1]))] = int(parts[1])
-                            except Exception:
-                                pass
-                    print(
-                        f"[run_game] Loaded state_id_map: {len(state_id_map)} entries from {_sn_path}"
-                    )
-                except Exception as e:
-                    print(f"[run_game] Warning: Failed to load state_node.txt: {e}")
-            else:
-                print(f"[run_game] Warning: state_node.txt not found at {_sn_path}")
+        else:
+            _sn_path = None
+        if _sn_path is None or not _sn_path.exists():
+            _aug_sn = _PATH_CONFIG.get("_GAME_AUGMENTED_STATE_NODE_PATH", "")
+            if _aug_sn and os.path.exists(_aug_sn):
+                _sn_path = Path(_aug_sn)
+        if _sn_path and _sn_path.exists():
+            try:
+                for line in _sn_path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split("\t")
+                    if len(parts) >= 2:
+                        try:
+                            ps = ast.literal_eval(parts[0])
+                            state_id_map[(int(ps[0]), int(ps[1]))] = int(parts[1])
+                        except Exception:
+                            pass
+                print(
+                    f"[run_game] Loaded state_id_map: {len(state_id_map)} entries from {_sn_path}"
+                )
+            except Exception as e:
+                print(f"[run_game] Warning: Failed to load state_node.txt: {e}")
+        else:
+            _sn_display = _sn_path if _sn_path else "augmented path (not found)"
+            print(f"[run_game] Warning: state_node.txt not found ({_sn_display})")
 
         _kg = None
         _transitions = None
@@ -495,6 +510,11 @@ def run_game(
                 _map_id, _data_id = _dp.parts[-2], _dp.parts[-1]
                 _npy_dir = _ROOT / "cache" / "npy"
                 _dm_path = _npy_dir / f"state_distance_matrix_{_map_id}_{_data_id}.npy"
+                if not _dm_path.exists():
+                    _dm_path = (
+                        _npy_dir
+                        / "state_distance_matrix_MarineMicro_MvsM_4_augmented_1.npy"
+                    )
                 if _dm_path.exists():
                     try:
                         import numpy as _np

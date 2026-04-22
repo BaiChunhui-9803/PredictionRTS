@@ -1,4 +1,15 @@
 knowledge_graphs:
+  # === MarineMicro_MvsM_4 (重采样数据集扩张) ===
+  - name: "MvsM4 - Augmented"
+    file: "MarineMicro_MvsM_4_augmented/kg_simple.pkl"
+    transitions: "MarineMicro_MvsM_4_augmented/kg_simple_transitions.pkl"
+    data_dir: "data/MarineMicro_MvsM_4/augmented_1"
+    type: "augmented"
+    context_window: 0
+    map_id: "MarineMicro_MvsM_4"
+    data_id: "augmented_1"
+    description: "MvsM4 重采样扩张 (39999 episodes, p=0.7 s=0.5)"
+
   # === MarineMicro_MvsM_4 (data_id=6) ===
   - name: "MvsM4 - Simple"
     file: "MarineMicro_MvsM_4/kg_simple.pkl"

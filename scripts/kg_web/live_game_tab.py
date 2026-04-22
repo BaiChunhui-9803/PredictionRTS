@@ -104,7 +104,7 @@ def _render_live_game_sidebar(kg_entry: Optional[Dict] = None):
     mode_options = ["单步推演", "多步推演"]
     if has_replay:
         mode_options.append("回放重演")
-        mode_options.append("数据增强（批量回放重演）")
+        mode_options.append("重采样数据集扩张（批量回放重演）")
     st.markdown("**推演模式**")
     live_mode = st.radio(
         "mode",
@@ -136,7 +136,7 @@ def _render_live_game_sidebar(kg_entry: Optional[Dict] = None):
     replay_count = 3
     primary_threshold = 1.0
     secondary_threshold = 0.5
-    if live_mode == "数据增强（批量回放重演）" and has_replay:
+    if live_mode == "重采样数据集扩张（批量回放重演）" and has_replay:
         n_ep_batch = ep_data["n_episodes"]
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -179,7 +179,7 @@ def _render_live_game_sidebar(kg_entry: Optional[Dict] = None):
             )
 
     live_backup = False
-    if live_mode not in ("回放重演", "数据增强（批量回放重演）"):
+    if live_mode not in ("回放重演", "重采样数据集扩张（批量回放重演）"):
         st.subheader("Beam Search 参数")
 
         c1, c2 = st.columns(2)
@@ -327,7 +327,7 @@ def _render_live_game_sidebar(kg_entry: Optional[Dict] = None):
                     ]
                 )
             cmd.extend(["--replay_runs", str(replay_runs)])
-        elif live_mode == "数据增强（批量回放重演）":
+        elif live_mode == "重采样数据集扩张（批量回放重演）":
             cmd.extend(["--autopilot_mode", "batch_replay"])
             cmd.extend(["--batch_start", str(batch_start)])
             cmd.extend(["--batch_end", str(batch_end)])
@@ -339,7 +339,7 @@ def _render_live_game_sidebar(kg_entry: Optional[Dict] = None):
         else:
             cmd.extend(["--autopilot_mode", "single_step"])
 
-        if live_mode not in ("回放重演", "数据增强（批量回放重演）"):
+        if live_mode not in ("回放重演", "重采样数据集扩张（批量回放重演）"):
             cmd.extend(["--beam_width", str(st.session_state.get("live_bw", 3))])
             cmd.extend(["--lookahead_steps", str(st.session_state.get("live_la", 5))])
             cmd.extend(["--score_mode", st.session_state.get("live_sm", "quality")])

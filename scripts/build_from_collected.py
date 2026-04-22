@@ -56,14 +56,63 @@ ACTION_MAP = {
 
 
 def load_collected_data(path: str) -> Dict[str, Any]:
-    logger.info(f"Loading collected data from {path}")
-    with open(path, "rb") as f:
-        data = pickle.load(f)
-    logger.info(
-        f"  Episodes: {data['total_episodes']}, "
-        f"Source: {data.get('source_action_log', '?')}"
-    )
-    return data
+    p = Path(path)
+    if p.is_dir():
+        pkl_files = sorted(p.glob("episodes_*.pkl"))
+        if not pkl_files:
+            legacy_files = sorted(p.glob("collected_data_*.pkl"))
+            if legacy_files:
+                pkl_files = legacy_files
+            else:
+                raise FileNotFoundError(
+                    f"No episodes_*.pkl or collected_data_*.pkl in {path}"
+                )
+        episodes = []
+        for pkl_path in pkl_files:
+            logger.info(f"  Loading incremental file: {pkl_path.name}")
+            count = 0
+            with open(pkl_path, "rb") as f:
+                while True:
+                    try:
+                        ep = pickle.load(f)
+                        episodes.append(ep)
+                        count += 1
+                    except EOFError:
+                        break
+                    except Exception as e:
+                        logger.warning(f"    Truncated at episode {count}: {e}")
+                        break
+            logger.info(f"    {count} episodes loaded")
+        stats_file = p / "batch_stats.json"
+        meta = {}
+        if stats_file.exists():
+            with open(stats_file, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        data = {
+            "source_action_log": meta.get("source_action_log", ""),
+            "batch_start": meta.get("batch_start", 0),
+            "batch_end": meta.get("batch_end", 0),
+            "replay_count": meta.get("replay_count", 0),
+            "primary_threshold": meta.get("primary_threshold", 1.0),
+            "secondary_threshold": meta.get("secondary_threshold", 0.5),
+            "total_episodes": len(episodes),
+            "episodes": episodes,
+        }
+        logger.info(f"  Total: {len(episodes)} episodes from {len(pkl_files)} file(s)")
+        return data
+    elif p.is_file() and p.suffix == ".pkl":
+        logger.info(f"Loading collected data from {path}")
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        logger.info(
+            f"  Episodes: {data['total_episodes']}, "
+            f"Source: {data.get('source_action_log', '?')}"
+        )
+        return data
+    else:
+        raise FileNotFoundError(
+            f"Invalid path: {path} (expected .pkl file or directory)"
+        )
 
 
 def build_cluster_mapping(
@@ -391,12 +440,13 @@ def main():
     episodes = data["episodes"]
 
     if args.output_dir is None:
-        source = data.get("source_action_log", "unknown")
+        source = data.get("source_action_log", "")
         map_id = "augmented"
-        for part in source.replace("\\", "/").split("/"):
-            if "MarineMicro" in part or "marine" in part.lower():
-                map_id = part
-                break
+        if source:
+            for part in source.replace("\\", "/").split("/"):
+                if "MarineMicro" in part or "marine" in part.lower():
+                    map_id = part
+                    break
         args.output_dir = str(
             ROOT_DIR / "cache" / "knowledge_graph" / f"{map_id}_augmented"
         )

@@ -76,6 +76,21 @@ class BKTree:
         )
         return best_id, best_dist
 
+    def find_node_by_cluster_id(self, cluster_id):
+        if self.root is None:
+            return None
+
+        def search_node(node):
+            if node.cluster_id == cluster_id:
+                return node
+            for child in node.children.values():
+                result = search_node(child)
+                if result is not None:
+                    return result
+            return None
+
+        return search_node(self.root)
+
     def get_next_cluster_id(self):
         return self.next_cluster_id
 
