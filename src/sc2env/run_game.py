@@ -371,6 +371,7 @@ def run_game(
     batch_output_dir: Optional[str] = None,
     primary_threshold: float = 1.0,
     secondary_threshold: float = 0.5,
+    max_episodes: Optional[int] = None,
 ):
     steps = _ENV_CONFIG["_MAX_STEP"]
     step_mul = _ENV_CONFIG["_STEP_MUL"]
@@ -575,7 +576,9 @@ def run_game(
                 [agent1, agent2],
                 env,
                 reset_frames=_ENV_CONFIG["_RESET_FRAMES"],
-                max_episodes=_ENV_CONFIG["_MAX_EPISODE"],
+                max_episodes=max_episodes
+                if max_episodes is not None
+                else _ENV_CONFIG["_MAX_EPISODE"],
                 bridge=bridge,
             )
             if bridge is None:

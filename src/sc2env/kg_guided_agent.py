@@ -110,6 +110,9 @@ class KGGuidedAgent(SmartAgent):
         self._frame_count: int = 0
         self._status_push_interval: int = 50
 
+        self._local_result_dir: Optional[str] = None
+        self._local_completed: int = 0
+
         if initial_bktree_data is not None:
             self._load_bktree_from_data(initial_bktree_data)
             self._bktree_loaded = True
@@ -513,6 +516,29 @@ class KGGuidedAgent(SmartAgent):
     def _flush_ep_batch(self):
         if not self._ep_batch:
             return
+        if self._local_result_dir:
+            import json as _json
+            from pathlib import Path as _Path
+
+            result_dir = _Path(self._local_result_dir)
+            result_dir.mkdir(parents=True, exist_ok=True)
+            ep_file = result_dir / "episodes.jsonl"
+            progress_file = result_dir / "progress.json"
+            with open(str(ep_file), "a", encoding="utf-8") as f:
+                for ep in self._ep_batch:
+                    record = {
+                        "episode_id": ep.get("episode_id", 0),
+                        "result": ep.get("result", "Unknown"),
+                        "score": ep.get("score", 0),
+                    }
+                    f.write(_json.dumps(record, ensure_ascii=False) + "\n")
+                    self._local_completed += 1
+            target = self._beam_params.get("target_episodes", 0)
+            progress = {"completed": self._local_completed}
+            if target > 0:
+                progress["target"] = target
+            with open(str(progress_file), "w", encoding="utf-8") as f:
+                _json.dump(progress, f)
         for ep in self._ep_batch:
             try:
                 self.bridge.put_history(ep)
@@ -524,6 +550,18 @@ class KGGuidedAgent(SmartAgent):
         from pysc2.lib import actions as sc2_actions
 
         super(SmartAgent, self).step(obs, env)
+
+        try:
+            while True:
+                new_params = self.bridge.param_update_queue.get_nowait()
+                if "mode" in new_params:
+                    self._mode = new_params["mode"]
+                if "local_result_dir" in new_params:
+                    self._local_result_dir = new_params["local_result_dir"]
+                    self._local_completed = 0
+                self._beam_params.update(new_params)
+        except Exception:
+            pass
 
         if obs.last():
             result_event = {
@@ -745,8 +783,7 @@ class KGGuidedAgent(SmartAgent):
                 )
                 self._ep_history = []
                 self._replay_frame_count = 0
-                if len(self._ep_batch) >= self._ep_push_batch_size:
-                    self._flush_ep_batch()
+                self._flush_ep_batch()
         self._prev_end_game_flag = end_flag
 
         if self._pending_cluster and hasattr(self, self._pending_cluster):

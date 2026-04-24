@@ -83,6 +83,7 @@ def _run_game_process(bridge, args):
         batch_end=args.batch_end,
         primary_threshold=args.primary_threshold,
         secondary_threshold=args.secondary_threshold,
+        max_episodes=args.max_episodes,
     )
 
 
@@ -215,6 +216,12 @@ def main():
         default=0.5,
         help="BKTree secondary cluster threshold (default: 0.5)",
     )
+    parser.add_argument(
+        "--max_episodes",
+        type=int,
+        default=None,
+        help="Max episodes per run (overrides config default)",
+    )
     args = parser.parse_args()
 
     if args.mode in ("game", "all") and args.kg_file is None:
@@ -224,7 +231,6 @@ def main():
         print("         You can load it later via: POST /game/load_kg?kg_file=xxx.pkl")
 
     if args.mode == "all":
-        bridge = mp.get_context("spawn").Manager().Queue() if False else None
         from src.sc2env.bridge import GameBridge
 
         bridge = GameBridge()

@@ -470,6 +470,7 @@ class BridgeServer:
         self._history_meta: Dict[int, Dict[str, Any]] = {}
         self._history_max_episodes: int = 100
         self._ep_detail_cache: Dict[int, Dict[str, Any]] = {}
+        self._total_completed: int = 0
 
     def add_log(self, level: str, source: str, message: str) -> None:
         self._log_seq += 1
@@ -723,6 +724,7 @@ class BridgeServer:
 
     def _drain_history(self) -> None:
         for ep_data in self.bridge.get_histories():
+            self._total_completed += 1
             ep_id = ep_data["episode_id"]
             self._history_store[ep_id] = ep_data["frames"]
             self._history_meta[ep_id] = {
@@ -746,6 +748,7 @@ class BridgeServer:
             "history_episodes": len(self._history_store),
             "history_frames": total_frames,
             "history_capacity": self._history_max_episodes,
+            "total_completed": self._total_completed,
         }
 
     def ack_history(self, episode_ids: List[int]) -> None:
@@ -984,7 +987,13 @@ def create_app(bridge: GameBridge) -> FastAPI:
         return {"ok": True, "acked": len(ids)}
 
     @app.post("/game/episodes/clear")
-    async def clear_episodes():
+    async def clear_episodes(req: dict = None):
+        req = req or {}
+        if "max_history" in req:
+            try:
+                _instance._history_max_episodes = int(req["max_history"])
+            except (TypeError, ValueError):
+                pass
         _instance._history_store.clear()
         _instance._history_meta.clear()
         _instance._ep_detail_cache.clear()
@@ -994,6 +1003,7 @@ def create_app(bridge: GameBridge) -> FastAPI:
     @app.post("/game/results/save")
     async def save_results(req: dict = None):
         max_count = req.get("max_count", 100) if req else 100
+        target_episodes = req.get("target_episodes", 0) if req else 0
         _instance._drain_history()
         if not _instance._history_store:
             raise HTTPException(status_code=404, detail="没有可保存的对局记录")
@@ -1007,7 +1017,10 @@ def create_app(bridge: GameBridge) -> FastAPI:
             map_id = parts if parts else "unknown"
 
         all_ids = sorted(_instance._history_meta.keys())
-        selected_ids = all_ids[:max_count]
+        if target_episodes > 0:
+            selected_ids = all_ids[-target_episodes:]
+        else:
+            selected_ids = all_ids[:max_count]
 
         episodes = []
         for ep_id in selected_ids:
@@ -1067,7 +1080,44 @@ def create_app(bridge: GameBridge) -> FastAPI:
         mode_label = mode
         if backup_enabled and mode not in ("single_step", "replay"):
             mode_label = f"{mode}_backup"
-        filename = f"{mode_label}_{ts}.json"
+        sm = agent_params.get("score_mode", "")
+        bw = agent_params.get("beam_width", "")
+        la = agent_params.get("max_steps", agent_params.get("lookahead_steps", ""))
+        as_ = agent_params.get("action_strategy", "")
+        mv = agent_params.get("min_visits")
+        msr = agent_params.get("max_state_revisits")
+        mcp = agent_params.get("min_cum_prob")
+        df = agent_params.get("discount_factor")
+        param_parts = []
+        if sm:
+            param_parts.append(f"sm{sm}")
+        if bw is not None and bw != "":
+            param_parts.append(f"bw{bw}")
+        if la is not None and la != "":
+            param_parts.append(f"la{la}")
+        if mv is not None:
+            param_parts.append(f"mv{mv}")
+        if msr is not None:
+            param_parts.append(f"msr{msr}")
+        if mcp is not None:
+            param_parts.append(f"mcp{mcp}")
+        if df is not None:
+            param_parts.append(f"df{df}")
+        if as_:
+            param_parts.append(f"as{as_}")
+        if as_ == "epsilon_greedy":
+            eps = agent_params.get("epsilon")
+            if eps is not None:
+                param_parts.append(f"eps{eps}")
+        if backup_enabled and mode not in ("single_step", "replay"):
+            bst = agent_params.get("backup_score_threshold")
+            if bst is not None:
+                param_parts.append(f"bp{bst}")
+            bdt = agent_params.get("backup_distance_threshold")
+            if bdt is not None:
+                param_parts.append(f"bd{bdt}")
+        param_str = "_".join(param_parts)
+        filename = f"{mode_label}_{param_str}_{ts}.json"
         filepath = results_dir / filename
         with open(str(filepath), "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -1213,6 +1263,14 @@ def create_app(bridge: GameBridge) -> FastAPI:
         except Exception:
             pass
         return {"status": "saved", "config": cfg}
+
+    @app.post("/game/beam_params")
+    async def update_beam_params(req: dict):
+        try:
+            _instance.bridge.param_update_queue.put_nowait(req)
+        except Exception:
+            pass
+        return {"ok": True}
 
     @app.post("/game/shutdown")
     async def shutdown():

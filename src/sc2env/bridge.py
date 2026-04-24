@@ -6,6 +6,7 @@ GameBridge — 进程间通信桥接层（精简版）
     control_queue:  API  → Agent  (暂停/恢复/停止)
     status_queue:   Agent → API   (状态增量更新，每N帧推送)
     history_queue:  Agent → API   (对局记录，每N局批量推送)
+    param_update_queue: API → Agent (beam参数热更新)
 """
 
 import time
@@ -20,7 +21,8 @@ class GameBridge:
         self.status_queue: Queue = Queue(maxsize=100)
         self._stop_event = Event()
         self._run_episode_event = Event()
-        self.history_queue: Queue = Queue(maxsize=100)
+        self.history_queue: Queue = Queue(maxsize=50000)
+        self.param_update_queue: Queue = Queue(maxsize=1)
 
     # ---- Agent → API ----
 

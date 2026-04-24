@@ -26,6 +26,7 @@ from kg_web.rollout_tab import _render_rollout_tab
 from kg_web.raw_data_tab import _render_raw_data_tab
 from kg_web.live_game_tab import _render_live_game_sidebar, _render_live_game_content
 from kg_web.results_tab import _render_results_tab
+from kg_web.learner_tab import _render_learner_tab, _render_learner_sidebar
 
 
 def main():
@@ -39,14 +40,16 @@ def main():
     st.markdown("交互式浏览经验转移图 + 图上束搜索规划。")
 
     _TAB_OPTIONS = [
+        "项目介绍",
         "转移图可视化",
         "束搜索规划",
         "滚动推演",
         "原始数据",
         "实时对局",
         "结果分析",
+        "参数寻优",
     ]
-    _TAB_ICONS = ["🕸️", "🔮", "🎮", "📊", "⚡", "📈"]
+    _TAB_ICONS = ["📋", "🕸️", "🔮", "🎮", "📊", "⚡", "📈", "🧪"]
 
     with st.sidebar:
         _sel = st.segmented_control(
@@ -62,51 +65,57 @@ def main():
         active_tab = _TAB_OPTIONS.index(_sel_val)
         st.session_state.active_tab = active_tab
 
-        st.divider()
+        kg_entry = {}
+        kg_data = {}
+        transitions = {}
+        kg_obj = None
 
-        catalog = load_kg_catalog()
-        if not catalog:
-            st.error("经验转移图目录为空，请检查 configs/kg_catalog.yaml")
-            st.stop()
+        if active_tab > 0:
+            st.divider()
 
-        maps: Dict[str, List[Dict]] = {}
-        for entry in catalog:
-            maps.setdefault(entry["map_id"], []).append(entry)
+            catalog = load_kg_catalog()
+            if not catalog:
+                st.error("经验转移图目录为空，请检查 configs/kg_catalog.yaml")
+                st.stop()
 
-        map_ids = list(maps.keys())
-        selected_map = st.selectbox("地图", map_ids)
+            maps: Dict[str, List[Dict]] = {}
+            for entry in catalog:
+                maps.setdefault(entry["map_id"], []).append(entry)
 
-        map_entries = maps[selected_map]
-        kg_names = [e["name"] for e in map_entries]
-        selected_kg_idx = st.selectbox(
-            "经验转移图",
-            options=range(len(map_entries)),
-            format_func=lambda i: kg_names[i],
-        )
-        kg_entry = map_entries[selected_kg_idx]
-        st.caption(
-            f"📋 类型: {kg_entry.get('type', '-')}  |  "
-            f"窗口: {kg_entry.get('context_window', 0)}  |  "
-            f"data_id: {kg_entry.get('data_id', '-')}"
-        )
+            map_ids = list(maps.keys())
+            selected_map = st.selectbox("地图", map_ids)
 
-        kg_data, quality_min, quality_max = load_kg(kg_entry["file"])
-        transitions = load_transitions(kg_entry.get("transitions", ""))
-        kg_obj = load_kg_object(kg_entry["file"])
+            map_entries = maps[selected_map]
+            kg_names = [e["name"] for e in map_entries]
+            selected_kg_idx = st.selectbox(
+                "经验转移图",
+                options=range(len(map_entries)),
+                format_func=lambda i: kg_names[i],
+            )
+            kg_entry = map_entries[selected_kg_idx]
+            st.caption(
+                f"📋 类型: {kg_entry.get('type', '-')}  |  "
+                f"窗口: {kg_entry.get('context_window', 0)}  |  "
+                f"data_id: {kg_entry.get('data_id', '-')}"
+            )
 
-        if "quality_low" not in st.session_state:
-            st.session_state.quality_low = quality_min
-        if "quality_high" not in st.session_state:
-            st.session_state.quality_high = quality_max
+            kg_data, quality_min, quality_max = load_kg(kg_entry["file"])
+            transitions = load_transitions(kg_entry.get("transitions", ""))
+            kg_obj = load_kg_object(kg_entry["file"])
 
-        st.divider()
+            if "quality_low" not in st.session_state:
+                st.session_state.quality_low = quality_min
+            if "quality_high" not in st.session_state:
+                st.session_state.quality_high = quality_max
+
+            st.divider()
 
         _prev_tab = st.session_state.get("_prev_tab", -1)
         tab_just_switched = _prev_tab != active_tab
         st.session_state._prev_tab = active_tab
 
-        if not tab_just_switched:
-            if active_tab == 0:
+        if active_tab > 0 and not tab_just_switched:
+            if active_tab == 1:
                 focus_enabled = st.checkbox(
                     "🎯 聚焦模式",
                     value=True,
@@ -255,7 +264,7 @@ def main():
                 st.divider()
                 st.caption("数据来源: `cache/knowledge_graph/`")
 
-            elif active_tab == 1:
+            elif active_tab == 2:
                 c1, c2 = st.columns(2)
                 with c1:
                     st.number_input(
@@ -326,7 +335,7 @@ def main():
                     key="pred_btn",
                 )
 
-            elif active_tab == 2:
+            elif active_tab == 3:
                 st.caption("单步规划参数（每步束搜索）")
                 c1, c2 = st.columns(2)
                 with c1:
@@ -464,8 +473,11 @@ def main():
                     key="roll_btn",
                 )
 
-            elif active_tab == 4:
+            elif active_tab == 5:
                 _render_live_game_sidebar(kg_entry)
+
+            elif active_tab == 7:
+                _render_learner_sidebar(kg_entry)
 
     st.markdown(f"### {_TAB_ICONS[active_tab]} {_TAB_OPTIONS[active_tab]}")
 
@@ -474,6 +486,13 @@ def main():
         st.rerun()
 
     if active_tab == 0:
+        readme_path = Path(__file__).parent.parent / "README.md"
+        if readme_path.exists():
+            st.markdown(readme_path.read_text(encoding="utf-8"))
+        else:
+            st.info("README.md 尚未创建。请在项目根目录放置 README.md 文件。")
+
+    elif active_tab == 1:
         _render_visualization_tab(
             kg_data,
             transitions,
@@ -494,20 +513,23 @@ def main():
             freeze_layout,
         )
 
-    elif active_tab == 1:
+    elif active_tab == 2:
         _render_prediction_tab(kg_data, transitions, kg_entry, kg_obj)
 
-    elif active_tab == 2:
+    elif active_tab == 3:
         _render_rollout_tab(kg_data, transitions, kg_entry, kg_obj)
 
-    elif active_tab == 3:
+    elif active_tab == 4:
         _render_raw_data_tab(kg_entry)
 
-    elif active_tab == 4:
+    elif active_tab == 5:
         _render_live_game_content()
 
-    elif active_tab == 5:
+    elif active_tab == 6:
         _render_results_tab()
+
+    elif active_tab == 7:
+        _render_learner_tab()
 
 
 if __name__ == "__main__":

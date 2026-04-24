@@ -30,10 +30,59 @@ def _scan_results():
             with open(str(jf), "r", encoding="utf-8") as f:
                 data = json.load(f)
             meta = data.get("metadata", {})
+            params = data.get("params", {})
+            mode_text = meta.get("mode", "?")
+            if meta.get("backup_enabled") and mode_text not in (
+                "single_step",
+                "replay",
+            ):
+                mode_text = f"{mode_text}_backup"
+            param_tags = []
+            sm = params.get("score_mode", "")
+            if sm:
+                param_tags.append(f"sm={sm}")
+            bw = params.get("beam_width")
+            if bw is not None:
+                param_tags.append(f"bw={bw}")
+            la = params.get("max_steps", params.get("lookahead_steps"))
+            if la is not None:
+                param_tags.append(f"la={la}")
+            mv = params.get("min_visits")
+            if mv is not None:
+                param_tags.append(f"mv={mv}")
+            msr = params.get("max_state_revisits")
+            if msr is not None:
+                param_tags.append(f"msr={msr}")
+            mcp = params.get("min_cum_prob")
+            if mcp is not None:
+                param_tags.append(f"mcp={mcp}")
+            df = params.get("discount_factor")
+            if df is not None:
+                param_tags.append(f"df={df}")
+            as_ = params.get("action_strategy", "")
+            if as_:
+                param_tags.append(f"as={as_}")
+            if as_ == "epsilon_greedy":
+                eps = params.get("epsilon")
+                if eps is not None:
+                    param_tags.append(f"eps={eps}")
+            if meta.get("backup_enabled") and mode_text.endswith("_backup"):
+                bst = params.get("backup_score_threshold")
+                if bst is not None:
+                    param_tags.append(f"bp={bst}")
+                bdt = params.get("backup_distance_threshold")
+                if bdt is not None:
+                    param_tags.append(f"bd={bdt}")
+            param_str = " ".join(param_tags) if param_tags else ""
+            label = (
+                f"{mode_text} | {param_str} | {meta.get('timestamp', '?')} | {meta.get('num_episodes', 0)}局"
+                if param_str
+                else f"{mode_text} | {meta.get('timestamp', '?')} | {meta.get('num_episodes', 0)}局"
+            )
             items.append(
                 {
                     "path": str(jf),
-                    "label": f"{meta.get('mode', '?')} | {meta.get('timestamp', '?')} | {meta.get('num_episodes', 0)}局",
+                    "label": label,
                     "map_id": meta.get("map_id", ""),
                     "mode": meta.get("mode", ""),
                     "timestamp": meta.get("timestamp", ""),
@@ -418,8 +467,20 @@ def _render_results_tab():
         elif result_filter == "仅 Loss":
             stats = [r for r in stats if not r["win"]]
         all_stats.append(stats)
-        short = label.split("|")[0].strip() if "|" in label else label
-        display_labels.append(short)
+        parts = label.split("|")
+        mode_part = parts[0].strip()
+        core_parts = []
+        if len(parts) > 1:
+            for tag in parts[1].split():
+                if (
+                    tag.startswith("sm=")
+                    or tag.startswith("bw=")
+                    or tag.startswith("la=")
+                    or tag.startswith("as=")
+                ):
+                    core_parts.append(tag)
+        core = (mode_part + " | " + " ".join(core_parts)) if core_parts else mode_part
+        display_labels.append(core)
 
     total_eps = sum(len(s) for s in all_stats)
     total_wins = sum(sum(1 for r in s if r["win"]) for s in all_stats)

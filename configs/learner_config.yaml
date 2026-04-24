@@ -1,0 +1,68 @@
+search_space:
+  mode:
+  - single_step
+  - multi_step
+  beam_width:
+  - 1
+  - 10
+  lookahead_steps:
+  - 1
+  - 15
+  score_mode:
+  - quality
+  - future_reward
+  - win_rate
+  action_strategy:
+  - best_beam
+  - best_subtree_quality
+  - best_subtree_winrate
+  - highest_transition_prob
+  - random_beam
+  - epsilon_greedy
+  min_visits:
+  - 1
+  - 10
+  max_state_revisits:
+  - 1
+  - 5
+  min_cum_prob:
+  - 0.001
+  - 0.1
+  discount_factor:
+  - 0.5
+  - 1.0
+  enable_backup:
+  - true
+  - false
+  epsilon:
+  - 0.01
+  - 0.5
+  backup_score_threshold:
+  - 0.0
+  - 1.0
+  backup_distance_threshold:
+  - 0.0
+  - 1.0
+objective:
+  win_rate_weight: 0.8
+  avg_score_weight: 0.2
+  stability_alpha: 0.5
+  stability_cap: 2.0
+  stability_segments: 5
+execution:
+  episodes_per_trial: 100
+  total_trials: 50
+  max_trials: 200
+  startup_wait_seconds: 30
+  completion_poll_interval: 5
+  completion_timeout_minutes: 60
+  save_timeout_seconds: 30
+game:
+  map_key: sce-1
+  kg_file: null
+  data_dir: null
+  autopilot_mode: multi_step
+  fallback_action: action_ATK_nearest_weakest
+storage:
+  study_db: sqlite:///output/learner_results/study.db
+  results_dir: output/learner_results
