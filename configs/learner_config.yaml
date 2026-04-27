@@ -47,7 +47,7 @@ objective:
   win_rate_weight: 0.8
   avg_score_weight: 0.2
   stability_alpha: 0.5
-  stability_cap: 2.0
+  stability_cap: 5.0
   stability_segments: 5
 execution:
   episodes_per_trial: 100

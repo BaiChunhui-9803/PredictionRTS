@@ -7,6 +7,7 @@ GameBridge — 进程间通信桥接层（精简版）
     status_queue:   Agent → API   (状态增量更新，每N帧推送)
     history_queue:  Agent → API   (对局记录，每N局批量推送)
     param_update_queue: API → Agent (beam参数热更新)
+    param_confirm_queue: Agent → API  (参数确认回传)
 """
 
 import time
@@ -23,6 +24,7 @@ class GameBridge:
         self._run_episode_event = Event()
         self.history_queue: Queue = Queue(maxsize=50000)
         self.param_update_queue: Queue = Queue(maxsize=1)
+        self.param_confirm_queue: Queue = Queue(maxsize=1)
 
     # ---- Agent → API ----
 
@@ -122,3 +124,19 @@ class GameBridge:
         except Exception:
             pass
         return result
+
+    # ---- Param Confirm (Agent → API) ----
+
+    def confirm_params(self, trial_number: int) -> None:
+        try:
+            if not self.param_confirm_queue.empty():
+                self.param_confirm_queue.get_nowait()
+            self.param_confirm_queue.put_nowait(trial_number)
+        except Exception:
+            pass
+
+    def check_param_confirm(self) -> Optional[int]:
+        try:
+            return self.param_confirm_queue.get_nowait()
+        except Exception:
+            return None

@@ -98,15 +98,94 @@ def _set_beam_params(port: int, params: dict) -> bool:
         return False
 
 
-def _wait_for_file_progress(trial_dir: Path, target: int, cfg: dict) -> bool:
+def _pause_game(port: int):
+    try:
+        requests.post(
+            f"http://127.0.0.1:{port}/game/control",
+            json={"command": "pause"},
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def _resume_game(port: int):
+    try:
+        requests.post(
+            f"http://127.0.0.1:{port}/game/control",
+            json={"command": "resume"},
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def _confirm_params_applied(
+    port: int, expected_trial: int, timeout: float = 10.0
+) -> bool:
+    url = f"http://127.0.0.1:{port}/game/param_confirm"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            r = requests.get(url, timeout=3)
+            if r.status_code == 200:
+                data = r.json()
+                confirmed = data.get("confirmed")
+                if confirmed == expected_trial:
+                    return True
+        except requests.RequestException:
+            pass
+        time.sleep(0.2)
+    return False
+
+
+def _wait_for_file_progress(
+    trial_dir: Path, target: int, cfg: dict, expected_trial: int = -1
+) -> bool:
     poll_interval = cfg["execution"].get("completion_poll_interval", 3)
     timeout_minutes = cfg["execution"].get("completion_timeout_minutes", 60)
     deadline = time.time() + timeout_minutes * 60
     progress_file = trial_dir / "progress.json"
+    ep_file = trial_dir / "episodes.jsonl"
     last_logged = 0
+    first_checked = False
 
     while time.time() < deadline:
         try:
+            if not first_checked and expected_trial >= 0 and ep_file.exists():
+                first_checked = True
+                with open(str(ep_file), "r", encoding="utf-8") as f:
+                    first_line = f.readline().strip()
+                if first_line:
+                    rec = json.loads(first_line)
+                    tn = rec.get("trial_number")
+                    if tn is not None and tn != expected_trial:
+                        print(
+                            f"  [WARN] first episode trial_number={tn}, expected={expected_trial}, truncating stale data"
+                        )
+                        valid_lines = []
+                        with open(str(ep_file), "r", encoding="utf-8") as rf:
+                            for ln in rf:
+                                ln_s = ln.strip()
+                                if not ln_s:
+                                    continue
+                                try:
+                                    r = json.loads(ln_s)
+                                    if r.get("trial_number") in (
+                                        expected_trial,
+                                        None,
+                                    ):
+                                        valid_lines.append(ln_s)
+                                except json.JSONDecodeError:
+                                    pass
+                        with open(str(ep_file), "w", encoding="utf-8") as wf:
+                            for valid_ln in valid_lines:
+                                wf.write(valid_ln + "\n")
+                        progress_file.write_text(
+                            json.dumps({"completed": len(valid_lines)}),
+                            encoding="utf-8",
+                        )
+
             if progress_file.exists():
                 data = json.loads(progress_file.read_text(encoding="utf-8"))
                 done = data.get("completed", 0)
@@ -146,7 +225,9 @@ def _compute_stability(episodes_results: list, num_segments: int) -> float:
     return wr_std + sc_std
 
 
-def _analyze_local_result(trial_dir: Path, num_segments: int) -> dict:
+def _analyze_local_result(
+    trial_dir: Path, num_segments: int, expected_trial: int = -1
+) -> dict:
     ep_file = trial_dir / "episodes.jsonl"
     if not ep_file.exists():
         return {
@@ -163,7 +244,12 @@ def _analyze_local_result(trial_dir: Path, num_segments: int) -> dict:
             line = line.strip()
             if line:
                 try:
-                    episodes.append(json.loads(line))
+                    ep = json.loads(line)
+                    if expected_trial >= 0:
+                        tn = ep.get("trial_number")
+                        if tn is not None and tn != expected_trial:
+                            continue
+                    episodes.append(ep)
                 except json.JSONDecodeError:
                     continue
 
@@ -268,6 +354,7 @@ class ParameterLearner:
         self._all_metrics = []
         self._current_proc = None
         self._port = None
+        self._source_trial = None
 
     def run(self, n_trials: int = None, resume: bool = False):
         total = n_trials or self.cfg["execution"]["total_trials"]
@@ -289,6 +376,14 @@ class ParameterLearner:
                 sampler=optuna.samplers.TPESampler(seed=42),
             )
             print(f"new study: {study_db}")
+
+        existing_batch = 0
+        for t in study.trials:
+            b = t.user_attrs.get("batch", 0)
+            if isinstance(b, int) and b > existing_batch:
+                existing_batch = b
+        self._batch = existing_batch + 1
+        print(f"  current batch: {self._batch}")
 
         signal.signal(signal.SIGINT, self._signal_handler)
 
@@ -396,6 +491,9 @@ class ParameterLearner:
     def _objective(self, trial: optuna.Trial, study: optuna.Study) -> float:
         space = self.cfg["search_space"]
         params = _sample_params(trial, space)
+        return self._execute_trial(trial, params)
+
+    def _execute_trial(self, trial: optuna.Trial, params: dict) -> float:
         target_episodes = self.cfg["execution"]["episodes_per_trial"]
         port = self._port
 
@@ -415,11 +513,22 @@ class ParameterLearner:
         send_params = dict(params)
         send_params["local_result_dir"] = str(trial_dir)
         send_params["target_episodes"] = target_episodes
+        send_params["trial_number"] = trial.number
 
-        if not _set_beam_params(port, send_params):
-            print("  [ERROR] failed to set beam params")
+        sent = False
+        for _attempt in range(3):
+            if _set_beam_params(port, send_params):
+                sent = True
+                break
+            print(f"  [WARN] set_beam_params failed, retrying...")
+            time.sleep(3)
+        if not sent:
+            print("  [ERROR] failed to set beam params after 3 attempts")
+            _pause_game(port)
             trial.set_user_attr("status", "error")
             return 0.0
+
+        _resume_game(port)
 
         run_record = {
             "trial": trial.number,
@@ -428,18 +537,25 @@ class ParameterLearner:
             "params": {k: v for k, v in params.items()},
             "start_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "status": "running",
+            "batch": self._batch,
+            "source_trial": self._source_trial,
         }
         run_path = self.runs_dir / f"trial_{trial.number:04d}_run.json"
         with open(str(run_path), "w", encoding="utf-8") as f:
             json.dump(run_record, f, ensure_ascii=False, indent=2)
 
         time.sleep(1)
-        completed = _wait_for_file_progress(trial_dir, target_episodes, self.cfg)
+        completed = _wait_for_file_progress(
+            trial_dir, target_episodes, self.cfg, expected_trial=trial.number
+        )
+        _pause_game(port)
 
         time.sleep(1)
         obj_cfg = self.cfg.get("objective", {})
         stability_segments = obj_cfg.get("stability_segments", 5)
-        metrics = _analyze_local_result(trial_dir, stability_segments)
+        metrics = _analyze_local_result(
+            trial_dir, stability_segments, expected_trial=trial.number
+        )
 
         win_rate = metrics["win_rate"]
         avg_score = metrics["avg_score"]
@@ -459,7 +575,7 @@ class ParameterLearner:
         w_win = obj_cfg.get("win_rate_weight", 0.8)
         w_score = obj_cfg.get("avg_score_weight", 0.2)
         alpha = obj_cfg.get("stability_alpha", 0.5)
-        cap = obj_cfg.get("stability_cap", 2.0)
+        cap = obj_cfg.get("stability_cap", 5.0)
 
         stability_norm = min(stability / cap, 1.0) if cap > 0 else 0.0
         penalty_factor = max(1 - alpha * stability_norm, 0.0)
@@ -467,6 +583,9 @@ class ParameterLearner:
         objective = win_rate * w_win + normalized_score * w_score * penalty_factor
 
         trial.set_user_attr("status", "completed")
+        trial.set_user_attr("batch", self._batch)
+        if self._source_trial is not None:
+            trial.set_user_attr("source_trial", self._source_trial)
         trial.set_user_attr("win_rate", win_rate)
         trial.set_user_attr("avg_score", avg_score)
         trial.set_user_attr("score_std", score_std)
@@ -496,6 +615,257 @@ class ParameterLearner:
             return 0.0
 
         return objective
+
+    def _rerun(self, source_trial_number: int, n_times: int):
+        import sqlite3
+
+        study_db = self.cfg["storage"].get(
+            "study_db", "sqlite:///output/learner_results/study.db"
+        )
+        study = optuna.load_study(study_name="beam_search", storage=study_db)
+        print(f"loaded study, {len(study.trials)} trials")
+
+        for t in study.trials:
+            if t.state == optuna.trial.TrialState.RUNNING:
+                try:
+                    study.tell(t.number, state=optuna.trial.TrialState.FAIL)
+                    print(f"  cleaned stale RUNNING trial #{t.number}")
+                except Exception:
+                    pass
+
+        source = None
+        for t in study.trials:
+            if t.number == source_trial_number:
+                source = t
+                break
+        if source is None:
+            print(f"[ERROR] Trial #{source_trial_number} not found")
+            return
+
+        params = dict(source.params)
+        print(f"rerun source: Trial #{source_trial_number}")
+        for k, v in params.items():
+            print(f"  {k}: {v}")
+        print(f"  repeat: {n_times} times")
+
+        self._source_trial = source_trial_number
+
+        existing_batch = 0
+        for t in study.trials:
+            b = t.user_attrs.get("batch", 0)
+            if isinstance(b, int) and b > existing_batch:
+                existing_batch = b
+        self._batch = existing_batch + 1
+        print(f"  batch: {self._batch}")
+
+        self._startup()
+        print("  waiting for game to fully initialize...")
+        time.sleep(10)
+
+        next_number = max(t.number for t in study.trials) + 1
+        db_path = study_db.replace("sqlite:///", "")
+
+        try:
+            for i in range(n_times):
+                trial_number = next_number + i
+                value = self._execute_trial_simple(trial_number, params)
+
+                self._record_trial_to_db(db_path, study, trial_number, params, value)
+
+                print(f"  [{i + 1}/{n_times}] Trial #{trial_number}: obj={value:.4f}")
+        except KeyboardInterrupt:
+            print("\ninterrupted, saving progress...")
+        finally:
+            self._shutdown()
+
+        self._save_summary(study)
+
+    def _execute_trial_simple(self, trial_number: int, params: dict) -> float:
+        target_episodes = self.cfg["execution"]["episodes_per_trial"]
+        port = self._port
+
+        print(f"\n{'=' * 60}")
+        print(f"Trial #{trial_number} (rerun)")
+        print(f"  target: {target_episodes} episodes")
+        print(f"{'=' * 60}")
+
+        trial_dir = self.trials_dir / f"trial_{trial_number:04d}"
+        trial_dir.mkdir(parents=True, exist_ok=True)
+
+        for fname in ("episodes.jsonl", "progress.json"):
+            fp = trial_dir / fname
+            if fp.exists():
+                if fname == "episodes.jsonl":
+                    fp.write_text("", encoding="utf-8")
+                else:
+                    fp.unlink()
+
+        send_params = dict(params)
+        send_params["local_result_dir"] = str(trial_dir)
+        send_params["target_episodes"] = target_episodes
+        send_params["trial_number"] = trial_number
+
+        sent = False
+        for _attempt in range(5):
+            if _set_beam_params(port, send_params):
+                sent = True
+                break
+            print(f"  [WARN] set_beam_params failed, retrying...")
+            time.sleep(5)
+        if not sent:
+            print("  [ERROR] failed to set beam params")
+            _pause_game(port)
+            return 0.0
+
+        _resume_game(port)
+
+        run_record = {
+            "trial": trial_number,
+            "port": port,
+            "target_episodes": target_episodes,
+            "params": {k: v for k, v in params.items()},
+            "start_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "status": "running",
+            "batch": self._batch,
+            "source_trial": self._source_trial,
+        }
+        run_path = self.runs_dir / f"trial_{trial_number:04d}_run.json"
+        with open(str(run_path), "w", encoding="utf-8") as f:
+            json.dump(run_record, f, ensure_ascii=False, indent=2)
+
+        time.sleep(1)
+        completed = _wait_for_file_progress(
+            trial_dir, target_episodes, self.cfg, expected_trial=trial_number
+        )
+        _pause_game(port)
+
+        time.sleep(1)
+        obj_cfg = self.cfg.get("objective", {})
+        stability_segments = obj_cfg.get("stability_segments", 5)
+        metrics = _analyze_local_result(
+            trial_dir, stability_segments, expected_trial=trial_number
+        )
+
+        win_rate = metrics["win_rate"]
+        avg_score = metrics["avg_score"]
+        stability = metrics["stability"]
+
+        self._all_metrics.append(metrics)
+        all_avg_scores = [m["avg_score"] for m in self._all_metrics]
+        score_min = min(all_avg_scores)
+        score_max = max(all_avg_scores)
+        score_range = score_max - score_min
+        normalized_score = (
+            (avg_score - score_min) / score_range if score_range > 0 else 0.5
+        )
+
+        w_win = obj_cfg.get("win_rate_weight", 0.8)
+        w_score = obj_cfg.get("avg_score_weight", 0.2)
+        alpha = obj_cfg.get("stability_alpha", 0.5)
+        cap = obj_cfg.get("stability_cap", 5.0)
+
+        stability_norm = min(stability / cap, 1.0) if cap > 0 else 0.0
+        penalty_factor = max(1 - alpha * stability_norm, 0.0)
+        objective = win_rate * w_win + normalized_score * w_score * penalty_factor
+
+        run_record["status"] = "completed" if completed else "timeout"
+        run_record["end_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        run_record["metrics"] = metrics
+        run_record["objective"] = objective
+        with open(str(run_path), "w", encoding="utf-8") as f:
+            json.dump(run_record, f, ensure_ascii=False, indent=2)
+
+        status = "completed" if completed else "timeout"
+        print(
+            f"  win_rate: {win_rate:.2%}  avg_score: {avg_score:.1f}  "
+            f"stability: {stability:.4f}  penalty: {penalty_factor:.2f}"
+        )
+        print(f"  objective: {objective:.4f}  status: {status}")
+
+        return objective
+
+    def _record_trial_to_db(self, db_path, study, trial_number, params, value):
+        import sqlite3
+
+        attrs = {
+            "status": "completed" if value > 0 else "timeout",
+            "batch": self._batch,
+            "win_rate": self._all_metrics[-1]["win_rate"] if self._all_metrics else 0,
+            "avg_score": self._all_metrics[-1]["avg_score"] if self._all_metrics else 0,
+            "score_std": self._all_metrics[-1]["score_std"] if self._all_metrics else 0,
+            "stability": self._all_metrics[-1]["stability"] if self._all_metrics else 0,
+            "num_episodes": self._all_metrics[-1]["num_episodes"]
+            if self._all_metrics
+            else 0,
+        }
+        if self._source_trial is not None:
+            attrs["source_trial"] = self._source_trial
+
+        try:
+            db = sqlite3.connect(str(db_path))
+            cur = db.cursor()
+            cur.execute("SELECT study_id FROM studies WHERE study_name = 'beam_search'")
+            row = cur.fetchone()
+            if not row:
+                db.close()
+                return
+            study_id = row[0]
+
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+            cur.execute(
+                "INSERT INTO trials (number, study_id, state, datetime_start, datetime_complete) "
+                "VALUES (?, ?, 'COMPLETE', ?, ?)",
+                (trial_number, study_id, now, now),
+            )
+            trial_id = cur.lastrowid
+
+            cur.execute(
+                "INSERT INTO trial_values (trial_id, objective, value, value_type) VALUES (?, 0, ?, 'FINITE')",
+                (trial_id, value),
+            )
+
+            if self._source_trial is not None:
+                cur.execute(
+                    "SELECT trial_id FROM trials WHERE number = ?",
+                    (self._source_trial,),
+                )
+                src_row = cur.fetchone()
+                if src_row:
+                    cur.execute(
+                        "SELECT param_name, param_value, distribution_json "
+                        "FROM trial_params WHERE trial_id = ?",
+                        (src_row[0],),
+                    )
+                    for pname, pval, dist_json in cur.fetchall():
+                        cur.execute(
+                            "INSERT INTO trial_params "
+                            "(trial_id, param_name, param_value, distribution_json) "
+                            "VALUES (?, ?, ?, ?)",
+                            (trial_id, pname, pval, dist_json),
+                        )
+            else:
+                for k, v in params.items():
+                    cur.execute(
+                        "INSERT INTO trial_params "
+                        "(trial_id, param_name, param_value, distribution_json) "
+                        "VALUES (?, ?, ?, ?)",
+                        (trial_id, k, str(v), json.dumps({"name": k})),
+                    )
+
+            for k, v in attrs.items():
+                cur.execute(
+                    "INSERT INTO trial_user_attributes (trial_id, key, value_json) VALUES (?, ?, ?)",
+                    (trial_id, k, json.dumps(v)),
+                )
+
+            db.commit()
+            db.close()
+            print(f"  recorded Trial #{trial_number} to DB (trial_id={trial_id})")
+        except Exception as e:
+            print(f"  [ERROR] failed to record trial to DB: {e}")
+            import traceback
+
+            traceback.print_exc()
 
     def _print_best(self, study: optuna.Study):
         best = study.best_trial
@@ -551,6 +921,12 @@ def main():
     parser.add_argument("--kg_file", default=None, help="KG pickle file")
     parser.add_argument("--data_dir", default=None, help="data dir")
     parser.add_argument("--resume", action="store_true", help="resume from last")
+    parser.add_argument(
+        "--rerun",
+        type=int,
+        default=None,
+        help="rerun specified trial with fixed params",
+    )
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
@@ -580,7 +956,10 @@ def main():
 
     try:
         learner = ParameterLearner(cfg)
-        learner.run(n_trials=cfg["execution"]["total_trials"], resume=args.resume)
+        if args.rerun is not None:
+            learner._rerun(args.rerun, n_times=1)
+        else:
+            learner.run(n_trials=cfg["execution"]["total_trials"], resume=args.resume)
     finally:
         pid_file.unlink(missing_ok=True)
 

@@ -1267,10 +1267,17 @@ def create_app(bridge: GameBridge) -> FastAPI:
     @app.post("/game/beam_params")
     async def update_beam_params(req: dict):
         try:
+            if not _instance.bridge.param_update_queue.empty():
+                _instance.bridge.param_update_queue.get_nowait()
             _instance.bridge.param_update_queue.put_nowait(req)
         except Exception:
             pass
         return {"ok": True}
+
+    @app.get("/game/param_confirm")
+    async def get_param_confirm():
+        trial_number = _instance.bridge.check_param_confirm()
+        return {"confirmed": trial_number}
 
     @app.post("/game/shutdown")
     async def shutdown():

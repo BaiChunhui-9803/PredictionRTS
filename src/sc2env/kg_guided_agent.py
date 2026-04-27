@@ -525,12 +525,15 @@ class KGGuidedAgent(SmartAgent):
             ep_file = result_dir / "episodes.jsonl"
             progress_file = result_dir / "progress.json"
             with open(str(ep_file), "a", encoding="utf-8") as f:
+                trial_number = self._beam_params.get("trial_number")
                 for ep in self._ep_batch:
                     record = {
                         "episode_id": ep.get("episode_id", 0),
                         "result": ep.get("result", "Unknown"),
                         "score": ep.get("score", 0),
                     }
+                    if trial_number is not None:
+                        record["trial_number"] = trial_number
                     f.write(_json.dumps(record, ensure_ascii=False) + "\n")
                     self._local_completed += 1
             target = self._beam_params.get("target_episodes", 0)
@@ -560,6 +563,8 @@ class KGGuidedAgent(SmartAgent):
                     self._local_result_dir = new_params["local_result_dir"]
                     self._local_completed = 0
                 self._beam_params.update(new_params)
+                if "trial_number" in new_params:
+                    self.bridge.confirm_params(new_params["trial_number"])
         except Exception:
             pass
 

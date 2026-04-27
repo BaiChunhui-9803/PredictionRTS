@@ -1,11 +1,14 @@
 import os
 import re
 import sys
+import shutil
 import subprocess
 import time
 import requests as _requests
 from pathlib import Path
 from typing import Optional, Dict
+
+import pandas as pd
 
 import yaml
 
@@ -15,6 +18,7 @@ import json
 import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import optuna
 
 from src import ROOT_DIR
@@ -42,7 +46,7 @@ def _load_summary():
     return None
 
 
-@st.cache_resource(ttl=10, show_spinner=False)
+@st.cache_resource(ttl=60, show_spinner=False)
 def _load_study():
     if _STUDY_DB.exists():
         try:
@@ -54,13 +58,35 @@ def _load_study():
     return None
 
 
+@st.cache_data(ttl=10, show_spinner=False)
+def _get_running_trial_number():
+    if not _PID_FILE.exists():
+        return None
+    if not _is_learner_alive():
+        return None
+    try:
+        import sqlite3 as _sqlite
+
+        db = _sqlite.connect(str(_STUDY_DB))
+        cur = db.cursor()
+        cur.execute(
+            "SELECT t.number FROM trials t WHERE t.state = 'RUNNING' ORDER BY t.number DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+        db.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
 def _get_running_trial(study):
     if not study:
         return None
+    num = _get_running_trial_number()
+    if num is None:
+        return None
     for t in study.trials:
-        if t.state == optuna.trial.TrialState.RUNNING:
-            if not _is_learner_alive():
-                continue
+        if t.number == num:
             return t
     return None
 
@@ -68,7 +94,7 @@ def _get_running_trial(study):
 _PID_FILE = _RESULTS_DIR / ".learner_pid"
 
 
-@st.cache_data(ttl=5, show_spinner=False)
+@st.cache_data(ttl=15, show_spinner=False)
 def _is_learner_alive():
     if not _PID_FILE.exists():
         return False
@@ -134,6 +160,10 @@ def _delete_trial(trial_number: int):
     run_json.unlink(missing_ok=True)
     run_log.unlink(missing_ok=True)
 
+    trial_dir = _TRIALS_DIR / f"trial_{trial_number:04d}"
+    if trial_dir.is_dir():
+        shutil.rmtree(trial_dir, ignore_errors=True)
+
     study = _load_study()
     if not study:
         return
@@ -149,6 +179,235 @@ def _delete_trial(trial_number: int):
                 except Exception:
                     pass
             break
+
+
+_BATCH_RULES = [
+    (0, 499, 1),
+    (500, 1787, 2),
+]
+
+
+def _migrate_batches():
+    if not _STUDY_DB.exists():
+        return
+    import sqlite3 as _sqlite
+
+    try:
+        db = _sqlite.connect(str(_STUDY_DB))
+        cur = db.cursor()
+
+        cur.execute(
+            "SELECT value_json FROM study_user_attributes WHERE key = 'batch_migrated'"
+        )
+        row = cur.fetchone()
+        if row and row[0] == '"true"':
+            db.close()
+            return
+
+        cur.execute("SELECT study_id FROM studies WHERE study_name = 'beam_search'")
+        srow = cur.fetchone()
+        if not srow:
+            db.close()
+            return
+        study_id = srow[0]
+
+        cur.execute(
+            "SELECT t.trial_id, t.number FROM trials t WHERE t.state IN ('COMPLETE', 'FAIL')"
+        )
+        trials = cur.fetchall()
+
+        for trial_id, number in trials:
+            cur.execute(
+                "SELECT 1 FROM trial_user_attributes WHERE trial_id = ? AND key = 'batch'",
+                (trial_id,),
+            )
+            if cur.fetchone():
+                continue
+
+            batch = 0
+            for lo, hi, b in _BATCH_RULES:
+                if lo <= number <= hi:
+                    batch = b
+                    break
+            if batch > 0:
+                cur.execute(
+                    "INSERT OR IGNORE INTO trial_user_attributes (trial_id, key, value_json) VALUES (?, ?, ?)",
+                    (trial_id, "batch", str(batch)),
+                )
+
+        cur.execute(
+            "INSERT OR REPLACE INTO study_user_attributes (study_id, key, value_json) VALUES (?, ?, ?)",
+            (study_id, "batch_migrated", '"true"'),
+        )
+        db.commit()
+        db.close()
+
+        if _RUNS_DIR.exists():
+            for fp in _RUNS_DIR.glob("trial_*_run.json"):
+                try:
+                    data = json.loads(fp.read_text(encoding="utf-8"))
+                    if "batch" not in data or data["batch"] is None:
+                        tn = data.get("trial")
+                        if isinstance(tn, int):
+                            batch = 0
+                            for lo, hi, b in _BATCH_RULES:
+                                if lo <= tn <= hi:
+                                    batch = b
+                                    break
+                            if batch > 0:
+                                data["batch"] = batch
+                                with open(str(fp), "w", encoding="utf-8") as f:
+                                    json.dump(data, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _get_batch_info():
+    if not _STUDY_DB.exists():
+        return {}
+    import sqlite3 as _sqlite
+
+    try:
+        db = _sqlite.connect(str(_STUDY_DB))
+        cur = db.cursor()
+        cur.execute("""
+            SELECT tua.value_json, COUNT(*), MIN(t.number), MAX(t.number)
+            FROM trial_user_attributes tua
+            JOIN trials t ON tua.trial_id = t.trial_id
+            WHERE tua.key = 'batch' AND t.state IN ('COMPLETE', 'FAIL')
+            GROUP BY tua.value_json
+            ORDER BY tua.value_json
+        """)
+        rows = cur.fetchall()
+        db.close()
+
+        result = {}
+        for val_json, count, min_num, max_num in rows:
+            batch = int(val_json)
+            result[batch] = {"count": count, "min_trial": min_num, "max_trial": max_num}
+        return result
+    except Exception:
+        return {}
+
+
+def _delete_batch(batch_num: int):
+    import sqlite3 as _sqlite
+
+    db = _sqlite.connect(str(_STUDY_DB))
+    cur = db.cursor()
+
+    cur.execute(
+        """
+        SELECT t.number FROM trial_user_attributes tua
+        JOIN trials t ON tua.trial_id = t.trial_id
+        WHERE tua.key = 'batch' AND tua.value_json = ?
+    """,
+        (str(batch_num),),
+    )
+    trial_numbers = [row[0] for row in cur.fetchall()]
+
+    cur.execute(
+        """
+        SELECT t.trial_id FROM trial_user_attributes tua
+        JOIN trials t ON tua.trial_id = t.trial_id
+        WHERE tua.key = 'batch' AND tua.value_json = ?
+    """,
+        (str(batch_num),),
+    )
+    trial_ids = [row[0] for row in cur.fetchall()]
+
+    for tid in trial_ids:
+        for table in (
+            "trial_user_attributes",
+            "trial_system_attributes",
+            "trial_params",
+            "trial_values",
+            "trial_intermediate_values",
+            "trial_heartbeats",
+        ):
+            cur.execute(f"DELETE FROM {table} WHERE trial_id = ?", (tid,))
+        cur.execute("DELETE FROM trials WHERE trial_id = ?", (tid,))
+
+    db.commit()
+    db.close()
+
+    for tn in trial_numbers:
+        run_json = _RUNS_DIR / f"trial_{tn:04d}_run.json"
+        run_log = _RUNS_DIR / f"trial_{tn:04d}.log"
+        run_json.unlink(missing_ok=True)
+        run_log.unlink(missing_ok=True)
+        trial_dir = _TRIALS_DIR / f"trial_{tn:04d}"
+        if trial_dir.is_dir():
+            shutil.rmtree(trial_dir, ignore_errors=True)
+
+    _load_study.clear()
+    _compute_importance.clear()
+    _load_trials_from_db.clear()
+    _load_runs.clear()
+    _get_batch_info.clear()
+
+
+def _clear_all_cache():
+    for fn in (
+        _load_study,
+        _compute_importance,
+        _load_trials_from_db,
+        _load_runs,
+        _get_batch_info,
+    ):
+        try:
+            fn.clear()
+        except Exception:
+            pass
+
+
+def _start_rerun(trial_numbers):
+    if _is_learner_alive():
+        st.error("参数寻优正在运行中，请先停止。")
+        return
+
+    episodes = st.session_state.get("learner_episodes", 100)
+
+    cmd = [
+        sys.executable,
+        str(ROOT_DIR / "scripts" / "parameter_learner.py"),
+        "--rerun",
+        str(trial_numbers[0]),
+        "--episodes",
+        str(episodes),
+        "--resume",
+    ]
+    kg_file = st.session_state.get("_learner_kg_file", "")
+    kg_data_dir = st.session_state.get("_learner_kg_data_dir", "")
+    if kg_file:
+        cmd.extend(["--kg_file", kg_file])
+    if kg_data_dir:
+        cmd.extend(["--data_dir", kg_data_dir])
+
+    _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    _RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    _TRIALS_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = _TRIALS_DIR / "learner.log"
+    log_file = open(str(log_path), "w", encoding="utf-8")
+    st.session_state.learner_log_file = log_file
+    flags = 0
+    if sys.platform == "win32":
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    p = subprocess.Popen(
+        cmd,
+        stdout=log_file,
+        stderr=log_file,
+        cwd=str(ROOT_DIR),
+        creationflags=flags,
+    )
+    st.session_state.learner_proc = p
+    _PID_FILE.write_text(str(p.pid))
+    st.toast(f"重跑已启动 (PID: {p.pid})", icon="🚀")
+    time.sleep(1)
+    st.rerun()
 
 
 _CONFIG_PATH = ROOT_DIR / "configs" / "learner_config.yaml"
@@ -322,6 +581,9 @@ def _render_learner_sidebar(kg_entry: Optional[Dict] = None):
     kg_name = kg_entry.get("name", "") if kg_entry else ""
     kg_data_dir = kg_entry.get("data_dir", "") if kg_entry else ""
 
+    st.session_state["_learner_kg_file"] = kg_file
+    st.session_state["_learner_kg_data_dir"] = kg_data_dir
+
     if kg_file:
         st.caption(f"KG: {kg_name}")
 
@@ -368,7 +630,7 @@ def _render_learner_sidebar(kg_entry: Optional[Dict] = None):
     st.number_input(
         "总试验轮数",
         min_value=1,
-        max_value=500,
+        max_value=5000,
         value=total_default,
         key="learner_trials",
     )
@@ -414,7 +676,7 @@ def _render_learner_sidebar(kg_entry: Optional[Dict] = None):
         "稳定性归一化上限 (cap)",
         min_value=0.1,
         max_value=10.0,
-        value=_obj_cfg.get("stability_cap", 2.0),
+        value=_obj_cfg.get("stability_cap", 5.0),
         step=0.1,
         format="%g",
         key="learner_cap",
@@ -546,14 +808,24 @@ def _plot_objective_history(study):
     st.plotly_chart(fig, use_container_width=True)
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def _compute_importance():
+    study = _load_study()
+    if not study or len(study.trials) < 5:
+        return None
+    try:
+        return dict(optuna.importance.get_param_importances(study))
+    except Exception:
+        return None
+
+
 def _plot_importance(study):
     if not study or len(study.trials) < 5:
         st.info("试验数据不足，至少需要 5 轮完成才能计算参数重要性。")
         return
 
-    try:
-        importance = optuna.importance.get_param_importances(study)
-    except Exception:
+    importance = _compute_importance()
+    if importance is None:
         st.info("无法计算参数重要性（可能缺少足够的参数变化）。")
         return
 
@@ -579,89 +851,257 @@ def _plot_importance(study):
         title="参数重要性",
         xaxis_title="重要性",
         yaxis_title="参数",
-        height=max(300, len(params) * 35 + 60),
+        height=680,
         margin=dict(l=150, r=30, t=50, b=40),
         yaxis=dict(autorange="reversed"),
     )
     st.plotly_chart(fig, use_container_width=True)
 
 
-def _plot_param_correlation(study):
-    if not study or len(study.trials) < 5:
-        st.info("试验数据不足，至少需要 5 轮完成才能计算参数相关性。")
-        return
-
-    completed = [
+def _get_completed_trials(study, min_count=5):
+    if not study or len(study.trials) < min_count:
+        return []
+    return [
         t
         for t in study.trials
         if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
     ]
+
+
+def _classify_params(completed):
+    all_keys = []
+    for t in completed:
+        for k in t.params:
+            if k not in all_keys:
+                all_keys.append(k)
+
+    numeric_keys = [
+        k
+        for k in all_keys
+        if isinstance(completed[0].params.get(k), (int, float))
+        and all(t.params.get(k) is not None for t in completed)
+    ]
+
+    categorical_keys = [
+        k
+        for k in all_keys
+        if isinstance(completed[0].params.get(k), str)
+        and all(t.params.get(k) is not None for t in completed)
+    ]
+
+    return numeric_keys, categorical_keys
+
+
+_METRIC_KEYS = ["objective", "win_rate", "avg_score", "stability"]
+_METRIC_LABELS = {
+    "objective": "Objective",
+    "win_rate": "Win Rate",
+    "avg_score": "Avg Score",
+    "stability": "Stability",
+}
+_METRIC_COLORS = {
+    "objective": "#636EFA",
+    "win_rate": "#00CC96",
+    "avg_score": "#EF553B",
+    "stability": "#AB63FA",
+}
+
+
+def _get_trial_metrics(t) -> dict:
+    return {
+        "objective": float(t.value) if t.value is not None else None,
+        "win_rate": t.user_attrs.get("win_rate"),
+        "avg_score": t.user_attrs.get("avg_score"),
+        "stability": t.user_attrs.get("stability"),
+    }
+
+
+def _plot_numeric_correlation(study):
+    completed = _get_completed_trials(study)
     if len(completed) < 5:
         st.info("完成的试验不足 5 轮。")
         return
 
-    numeric_keys = []
-    for t in completed:
-        for k, v in t.params.items():
-            if isinstance(v, (int, float)) and k not in numeric_keys:
-                numeric_keys.append(k)
+    numeric_keys, _ = _classify_params(completed)
 
     if not numeric_keys:
         st.info("无数值型参数。")
         return
 
-    shared_keys = [
-        k for k in numeric_keys if all(t.params.get(k) is not None for t in completed)
-    ]
-    if len(shared_keys) < 2:
-        st.info("共享的数值型参数不足 2 个。")
+    valid_metrics = []
+    for mk in _METRIC_KEYS:
+        vals = [_get_trial_metrics(t).get(mk) for t in completed]
+        if all(v is not None for v in vals):
+            valid_metrics.append(mk)
+
+    if not valid_metrics:
+        st.info("指标数据不完整。")
         return
 
-    labels = shared_keys + ["Objective"]
-    data_matrix = []
-    for t in completed:
-        row = [float(t.params[k]) for k in shared_keys]
-        row.append(float(t.value))
-        data_matrix.append(row)
+    corr_results = {}
+    for mk in valid_metrics:
+        metric_vals = [_get_trial_metrics(t)[mk] for t in completed]
+        data_matrix = []
+        for t in completed:
+            row = [float(t.params[k]) for k in numeric_keys]
+            row.append(float(metric_vals[completed.index(t)]))
+            data_matrix.append(row)
 
-    arr = np.array(data_matrix)
-    if arr.shape[0] < 2:
+        arr = np.array(data_matrix)
+        if arr.shape[0] < 2:
+            continue
+        corr = np.corrcoef(arr, rowvar=False)
+        corr_results[mk] = corr[-1, :-1]
+
+    if not corr_results:
         st.info("数据不足以计算相关性。")
         return
 
-    corr = np.corrcoef(arr, rowvar=False)
-    correlations = corr[-1, :-1]
-
+    first_mk = valid_metrics[0]
     sorted_pairs = sorted(
-        zip(shared_keys, correlations), key=lambda x: abs(x[1]), reverse=True
+        zip(numeric_keys, corr_results[first_mk]),
+        key=lambda x: abs(x[1]),
+        reverse=True,
     )
     param_names = [p[0] for p in sorted_pairs]
-    corr_values = [p[1] for p in sorted_pairs]
-    bar_colors = ["#4C72B0" if v >= 0 else "#DD8452" for v in corr_values]
-    bar_texts = [f"{v:+.3f}" for v in corr_values]
 
-    fig = go.Figure(
-        go.Bar(
-            x=corr_values,
-            y=param_names,
-            orientation="h",
-            marker_color=bar_colors,
-            text=bar_texts,
-            textposition="outside",
-            textfont=dict(size=11),
+    fig = go.Figure()
+    for mk in valid_metrics:
+        corr_vals = [corr_results[mk][numeric_keys.index(p)] for p in param_names]
+        fig.add_trace(
+            go.Bar(
+                name=_METRIC_LABELS[mk],
+                x=corr_vals,
+                y=param_names,
+                orientation="h",
+                marker_color=_METRIC_COLORS[mk],
+                text=[f"{v:+.3f}" for v in corr_vals],
+                textposition="outside",
+                textfont=dict(size=9),
+            )
         )
-    )
+
+    n_groups = len(param_names)
     fig.update_layout(
-        title="参数与目标值的相关性（Pearson）",
+        title="参数相关性",
         xaxis_title="相关系数",
-        xaxis_range=[-1, 1],
+        xaxis_range=[-1.3, 1.3],
         yaxis_title="参数",
-        height=max(300, len(param_names) * 35 + 60),
-        margin=dict(l=150, r=50, t=50, b=40),
+        height=680,
+        margin=dict(l=150, r=60, t=50, b=40),
         yaxis=dict(autorange="reversed"),
+        barmode="group",
         bargap=0.3,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     fig.add_vline(x=0, line_dash="dash", line_color="gray", line_width=1)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _plot_categorical_effect(study, cat_key):
+    completed = _get_completed_trials(study, min_count=3)
+    if len(completed) < 3:
+        st.info("试验数据不足。")
+        return
+
+    cat_labels = {
+        "score_mode": "Score Mode",
+        "action_strategy": "Action Strategy",
+        "mode": "Mode",
+        "enable_backup": "Backup",
+    }
+    label = cat_labels.get(cat_key, cat_key)
+
+    groups = {}
+    for t in completed:
+        val = t.params.get(cat_key)
+        if val is None:
+            continue
+        display = (
+            _ACTION_STRATEGY_LABELS.get(val, val)
+            if cat_key == "action_strategy"
+            else val
+        )
+        metrics = _get_trial_metrics(t)
+        groups.setdefault(display, []).append(metrics)
+
+    if len(groups) < 2:
+        st.info(f"{label} 只有单一取值。")
+        return
+
+    valid_metrics = [
+        mk
+        for mk in _METRIC_KEYS
+        if all(g[0].get(mk) is not None for g in groups.values() if g)
+    ]
+    if not valid_metrics:
+        st.info("指标数据不完整。")
+        return
+
+    sorted_groups = sorted(
+        groups.items(),
+        key=lambda x: np.mean([m.get("objective", 0) or 0 for m in x[1]]),
+        reverse=True,
+    )
+    names = [name for name, _ in sorted_groups]
+
+    has_avg_score = "avg_score" in valid_metrics
+    if has_avg_score:
+        fig = make_subplots(
+            rows=2,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.05,
+            row_heights=[0.55, 0.45],
+        )
+    else:
+        fig = go.Figure()
+
+    for mk in valid_metrics:
+        means = [np.mean([m[mk] for m in grp]) for _, grp in sorted_groups]
+        stds = [np.std([m[mk] for m in grp]) for _, grp in sorted_groups]
+
+        text_labels = []
+        for v in means:
+            if mk == "win_rate":
+                text_labels.append(f"{v:.1%}")
+            elif mk == "avg_score":
+                text_labels.append(f"{v:.1f}")
+            else:
+                text_labels.append(f"{v:.3f}")
+
+        trace = go.Bar(
+            name=_METRIC_LABELS[mk],
+            x=names,
+            y=means,
+            error_y=dict(type="data", array=stds, visible=True),
+            marker_color=_METRIC_COLORS[mk],
+            text=text_labels,
+            textposition="outside",
+            textfont=dict(size=9),
+            legendgroup=_METRIC_LABELS[mk],
+            showlegend=True,
+        )
+        if has_avg_score:
+            row = 2 if mk == "avg_score" else 1
+            fig.add_trace(trace, row=row, col=1)
+        else:
+            fig.add_trace(trace)
+
+    layout_kwargs = dict(
+        title=f"{label}",
+        height=340,
+        margin=dict(l=60, r=30, t=40, b=30),
+        xaxis_tickangle=-25,
+        barmode="group",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    if has_avg_score:
+        fig.update_yaxes(title_text="Obj / WR / Stability", row=1, col=1)
+        fig.update_yaxes(title_text="Avg Score", row=2, col=1)
+        fig.update_xaxes(showticklabels=False, row=1, col=1)
+        fig.update_xaxes(tickangle=-25, row=2, col=1)
+    fig.update_layout(**layout_kwargs)
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -678,21 +1118,53 @@ def _plot_parallel_coordinates(study):
         st.info("试验数据不足。")
         return
 
-    numeric_keys = []
+    all_keys = []
     for t in completed:
-        for k, v in t.params.items():
-            if isinstance(v, (int, float)) and k not in numeric_keys:
-                numeric_keys.append(k)
+        for k in t.params:
+            if k not in all_keys:
+                all_keys.append(k)
 
-    shared_keys = [
-        k for k in numeric_keys if all(t.params.get(k) is not None for t in completed)
+    numeric_keys = [
+        k
+        for k in all_keys
+        if isinstance(completed[0].params.get(k), (int, float))
+        and all(t.params.get(k) is not None for t in completed)
     ]
-    if not shared_keys:
-        st.info("无数值型参数可显示。")
+
+    categorical_keys = [
+        k
+        for k in all_keys
+        if isinstance(completed[0].params.get(k), str)
+        and all(t.params.get(k) is not None for t in completed)
+    ]
+
+    cat_display_order = ["mode", "score_mode", "action_strategy", "enable_backup"]
+    categorical_keys = [k for k in cat_display_order if k in categorical_keys]
+
+    if not numeric_keys and not categorical_keys:
+        st.info("无可显示的参数。")
         return
 
     dimensions = []
-    for key in shared_keys:
+
+    for key in categorical_keys:
+        unique_vals = sorted(set(t.params[key] for t in completed))
+        val_to_int = {v: i for i, v in enumerate(unique_vals)}
+        display_vals = [
+            _ACTION_STRATEGY_LABELS.get(v, v) if key == "action_strategy" else v
+            for v in unique_vals
+        ]
+        dimensions.append(
+            dict(
+                label=key,
+                values=[val_to_int[t.params[key]] for t in completed],
+                range=[-0.5, len(unique_vals) - 0.5],
+                ticktext=display_vals,
+                tickvals=list(range(len(unique_vals))),
+            )
+        )
+
+    for key in numeric_keys:
         vals = [t.params[key] for t in completed]
         v_min, v_max = min(vals), max(vals)
         padding = (v_max - v_min) * 0.05 if v_max > v_min else 0.5
@@ -718,7 +1190,7 @@ def _plot_parallel_coordinates(study):
     fig.update_layout(
         height=400,
         margin=dict(l=80, r=50, t=50, b=40),
-        font=dict(color="#333"),
+        font=dict(color="#333", size=14),
     )
     st.plotly_chart(fig, use_container_width=True)
 
@@ -755,26 +1227,237 @@ def _render_best_params(study, summary):
             st.write(f"**{k}**: {label}")
 
 
+_PAGE_SIZE_TABLE = 100
+_PAGE_SIZE_MONITOR = 50
+
+_CATEGORICAL_PARAM_MAP = {
+    "score_mode": {0: "quality", 1: "future_reward", 2: "win_rate"},
+    "action_strategy": {
+        0: "best_beam",
+        1: "best_subtree_quality",
+        2: "best_subtree_winrate",
+        3: "highest_transition_prob",
+        4: "random_beam",
+        5: "epsilon_greedy",
+    },
+    "mode": {0: "single_step", 1: "multi_step"},
+    "enable_backup": {0: False, 1: True},
+}
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _load_trials_from_db():
+    if not _STUDY_DB.exists():
+        return []
+    import sqlite3 as _sqlite
+
+    try:
+        db = _sqlite.connect(str(_STUDY_DB))
+        cur = db.cursor()
+        cur.execute("""
+            SELECT t.number, tv.value, tp.param_name, tp.param_value,
+                   GROUP_CONCAT(tua.key || '||' || tua.value_json, '&&')
+            FROM trials t
+            JOIN trial_values tv ON t.trial_id = tv.trial_id
+            JOIN trial_params tp ON t.trial_id = tp.trial_id
+            LEFT JOIN trial_user_attributes tua ON t.trial_id = tua.trial_id
+            WHERE t.state = 'COMPLETE' AND tv.value IS NOT NULL
+            GROUP BY t.trial_id
+            ORDER BY t.number
+        """)
+        raw_rows = cur.fetchall()
+        db.close()
+    except Exception:
+        return []
+
+    rows = []
+    for r in raw_rows:
+        num, val, pname, pval, attrs_str = r
+        attrs = {}
+        if attrs_str:
+            for pair in attrs_str.split("&&"):
+                if "||" in pair:
+                    k, v = pair.split("||", 1)
+                    try:
+                        attrs[k] = json.loads(v)
+                    except Exception:
+                        pass
+        rows.append(
+            {
+                "trial": num,
+                "params": {},
+                "metrics": {
+                    "win_rate": attrs.get("win_rate", 0),
+                    "avg_score": attrs.get("avg_score", 0),
+                    "stability": attrs.get("stability", 0),
+                },
+                "objective": val,
+                "status": "completed",
+                "batch": attrs.get("batch"),
+            }
+        )
+
+    params_by_trial = {}
+    if _STUDY_DB.exists():
+        db2 = _sqlite.connect(str(_STUDY_DB))
+        cur2 = db2.cursor()
+        cur2.execute("""
+            SELECT t.number, tp.param_name, tp.param_value
+            FROM trials t
+            JOIN trial_params tp ON t.trial_id = tp.trial_id
+            WHERE t.state = 'COMPLETE'
+            ORDER BY t.number
+        """)
+        for num, pname, pval in cur2.fetchall():
+            params_by_trial.setdefault(num, {})[pname] = pval
+        db2.close()
+
+    for row in rows:
+        row["params"] = params_by_trial.get(row["trial"], {})
+
+    return rows
+
+
+def _paginate(items, page_key, page_size):
+    total = len(items)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    if page_key not in st.session_state:
+        st.session_state[page_key] = 0
+    st.session_state[page_key] = min(st.session_state[page_key], total_pages - 1)
+    page = st.session_state[page_key]
+    goto_key = f"{page_key}_goto"
+    if goto_key not in st.session_state:
+        st.session_state[goto_key] = page + 1
+    start = page * page_size
+    end = min(start + page_size, total)
+    return page, total_pages, start, end
+
+
+def _render_pagination(page, total_pages, page_key):
+    goto_key = f"{page_key}_goto"
+
+    def _on_prev():
+        cur = st.session_state.get(page_key, 0)
+        new_page = max(0, cur - 1)
+        st.session_state[page_key] = new_page
+        st.session_state[goto_key] = new_page + 1
+
+    def _on_next():
+        cur = st.session_state.get(page_key, 0)
+        new_page = min(total_pages - 1, cur + 1)
+        st.session_state[page_key] = new_page
+        st.session_state[goto_key] = new_page + 1
+
+    def _on_goto():
+        st.session_state[page_key] = st.session_state[goto_key] - 1
+
+    col_prev, col_info, col_next, col_goto = st.columns([1, 2, 1, 1.5])
+    with col_prev:
+        st.button(
+            "◀ 上一页", key=f"{page_key}_prev", disabled=(page <= 0), on_click=_on_prev
+        )
+    with col_info:
+        st.markdown(
+            f"<div style='text-align:center;padding-top:4px'>第 {page + 1} / {total_pages} 页</div>",
+            unsafe_allow_html=True,
+        )
+    with col_next:
+        st.button(
+            "下一页 ▶",
+            key=f"{page_key}_next",
+            disabled=(page >= total_pages - 1),
+            on_click=_on_next,
+        )
+    with col_goto:
+        st.number_input(
+            "跳转到页",
+            min_value=1,
+            max_value=total_pages,
+            key=goto_key,
+            step=1,
+            on_change=_on_goto,
+            label_visibility="collapsed",
+        )
+
+
+def _filter_rows(rows, keyword):
+    if not keyword.strip():
+        return rows
+    kw = keyword.strip().lower()
+    return [r for r in rows if kw in str(r).lower()]
+
+
 def _render_trials_table():
+    study = _load_study()
     runs = _load_runs()
-    if not runs:
+
+    all_rows = _load_trials_from_db()
+    if not all_rows and runs:
+        for run in runs:
+            all_rows.append(
+                {
+                    "trial": run.get("trial", 0),
+                    "params": run.get("params", {}),
+                    "metrics": run.get("metrics", {}),
+                    "objective": run.get("objective"),
+                    "status": run.get("status", "?"),
+                }
+            )
+
+    if not all_rows:
         st.info("暂无试验记录。")
         return
 
-    rows = []
-    for run in reversed(runs):
-        p = run.get("params", {})
-        m = run.get("metrics", {})
-        rows.append(
+    all_rows.sort(key=lambda x: x.get("trial", 0), reverse=True)
+
+    col_search, col_size = st.columns([2, 1])
+    with col_search:
+        keyword = st.text_input(
+            "Trial 编号", key="table_search", placeholder="输入编号精确查找"
+        )
+    with col_size:
+        _PAGE_SIZE_OPTIONS = [50, 100, 200, 500]
+        ps = st.selectbox(
+            "每页显示",
+            _PAGE_SIZE_OPTIONS,
+            index=_PAGE_SIZE_OPTIONS.index(_PAGE_SIZE_TABLE),
+            key="table_page_size",
+        )
+
+    if keyword.strip().isdigit():
+        target = int(keyword.strip())
+        filtered = [r for r in all_rows if r.get("trial") == target]
+    else:
+        filtered = all_rows
+
+    if not filtered:
+        st.info("无匹配结果。")
+        return
+
+    st.caption(
+        f"共 {len(filtered)} 条记录"
+        + (f"（已过滤，全部 {len(all_rows)} 条）" if keyword.strip() else "")
+    )
+
+    page, total_pages, start, end = _paginate(filtered, "table_page", ps)
+    _render_pagination(page, total_pages, "table_page")
+
+    display_rows = []
+    for r in filtered[start:end]:
+        p = r.get("params", {})
+        m = r.get("metrics", {})
+        display_rows.append(
             {
-                "Trial": f"#{run.get('trial', '?')}",
-                "状态": run.get("status", "?"),
+                "_trial_num": r.get("trial", 0),
+                "批次": r.get("batch", "-") or "-",
+                "Trial": f"#{r.get('trial', '?')}",
                 "score_mode": p.get("score_mode", ""),
                 "beam_width": p.get("beam_width", ""),
                 "lookahead": p.get("lookahead_steps", ""),
                 "action_strategy": _ACTION_STRATEGY_LABELS.get(
                     p.get("action_strategy", ""), p.get("action_strategy", "")
                 ),
+                "mode": p.get("mode", ""),
                 "min_visits": p.get("min_visits", ""),
                 "max_revisits": p.get("max_state_revisits", ""),
                 "min_cum_prob": f"{p.get('min_cum_prob', ''):.4f}"
@@ -784,18 +1467,61 @@ def _render_trials_table():
                 if isinstance(p.get("discount_factor"), float)
                 else p.get("discount_factor", ""),
                 "backup": "Yes" if p.get("enable_backup") else "No",
-                "胜率": f"{m.get('win_rate', 0):.1%}" if m else "-",
-                "平均得分": f"{m.get('avg_score', 0):.1f}" if m else "-",
-                "稳定性": f"{m.get('stability', 0):.4f}" if m else "-",
-                "目标值": f"{run.get('objective', 0):.4f}"
-                if run.get("objective") is not None
+                "胜率": f"{m.get('win_rate', 0):.1%}"
+                if m.get("win_rate") is not None
+                else "-",
+                "平均得分": f"{m.get('avg_score', 0):.1f}"
+                if m.get("avg_score") is not None
+                else "-",
+                "稳定性": f"{m.get('stability', 0):.4f}"
+                if m.get("stability") is not None
+                else "-",
+                "目标值": f"{r.get('objective', 0):.4f}"
+                if r.get("objective") is not None
                 else "-",
             }
         )
 
-    st.dataframe(rows, use_container_width=True, height=min(len(rows) * 35 + 50, 500))
+    df = pd.DataFrame(display_rows)
+    df.insert(0, "选择", False)
+    disabled_cols = [c for c in df.columns if c != "选择"]
+
+    edited = st.data_editor(
+        df,
+        use_container_width=True,
+        height=min(len(display_rows) * 35 + 50, 600),
+        disabled=disabled_cols,
+        hide_index=True,
+        key="table_editor",
+    )
+
+    selected = edited[edited["选择"] == True]
+    selected_trials = []
+    if len(selected) > 0:
+        for _, row in selected.iterrows():
+            trial_str = str(row.get("Trial", ""))
+            num_str = trial_str.replace("#", "")
+            if num_str.isdigit():
+                selected_trials.append(int(num_str))
+
+    if selected_trials:
+        st.caption(
+            f"已选中 {len(selected_trials)} 条: {', '.join(f'#{t}' for t in selected_trials)}"
+        )
+        col_rerun, col_del, col_spacer = st.columns([1, 1, 3])
+        with col_rerun:
+            if st.button("重跑选中", key="table_rerun_selected", type="primary"):
+                _start_rerun(selected_trials)
+        with col_del:
+            if st.button("删除选中", key="table_del_selected"):
+                for tn in selected_trials:
+                    _delete_trial(tn)
+                st.toast(f"已删除 {len(selected_trials)} 条", icon="🗑️")
+                _clear_all_cache()
+                st.rerun()
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def _load_runs():
     runs = []
     if not _RUNS_DIR.exists():
@@ -835,20 +1561,63 @@ def _render_run_monitor():
         st.info("暂无运行记录。启动参数寻优后将自动记录。")
         return
 
-    if st.button("刷新状态", key="monitor_refresh"):
-        st.rerun()
+    runs.reverse()
 
-    header_cols = st.columns([1, 1, 1.5, 2.5, 1.5, 1, 0.8])
-    header_labels = ["Trial", "端口", "时间", "参数", "状态", "指标", "操作"]
+    col_search, col_size = st.columns([2, 1])
+    with col_search:
+        keyword = st.text_input(
+            "Trial 编号", key="monitor_search", placeholder="输入编号精确查找"
+        )
+    with col_size:
+        _PAGE_SIZE_OPTIONS = [50, 100, 200, 500]
+        ps = st.selectbox(
+            "每页显示",
+            _PAGE_SIZE_OPTIONS,
+            index=_PAGE_SIZE_OPTIONS.index(_PAGE_SIZE_MONITOR),
+            key="monitor_page_size",
+        )
+
+    if keyword.strip().isdigit():
+        target = int(keyword.strip())
+        filtered = [r for r in runs if r.get("trial") == target]
+    else:
+        filtered = runs
+
+    if not filtered:
+        st.info("无匹配结果。")
+        return
+
+    st.caption(
+        f"共 {len(filtered)} 条记录"
+        + (f"（已过滤，全部 {len(runs)} 条）" if keyword.strip() else "")
+    )
+
+    page, total_pages, start, end = _paginate(filtered, "monitor_page", ps)
+    _render_pagination(page, total_pages, "monitor_page")
+
+    header_cols = st.columns([0.5, 1, 1, 1.5, 2.5, 1.5, 1, 1, 0.6, 0.6])
+    header_labels = [
+        "批次",
+        "Trial",
+        "端口",
+        "时间",
+        "参数",
+        "状态",
+        "指标",
+        "备注",
+        "重跑",
+        "删除",
+    ]
     for col, label in zip(header_cols, header_labels):
         col.caption(f"**{label}**")
 
-    for run in reversed(runs):
+    for run in filtered[start:end]:
         trial_num = run.get("trial", "?")
         p = run.get("params", {})
         status = run.get("status", "unknown")
         port = run.get("port", 0)
         target_episodes = run.get("target_episodes", 0)
+        batch = run.get("batch", "-") or "-"
 
         if status == "running":
             if isinstance(trial_num, int):
@@ -887,23 +1656,30 @@ def _render_run_monitor():
         else:
             metric_str = "-"
 
-        cols = st.columns([1, 1, 1.5, 2.5, 1.5, 1, 0.8])
-        cols[0].caption(f"#{trial_num}")
-        cols[1].caption(str(port))
-        cols[2].caption(run.get("start_time", ""))
-        cols[3].caption(param_summary)
+        cols = st.columns([0.5, 1, 1, 1.5, 2.5, 1.5, 1, 1, 0.6, 0.6])
+        cols[0].caption(str(batch))
+        cols[1].caption(f"#{trial_num}")
+        cols[2].caption(str(port))
+        cols[3].caption(run.get("start_time", ""))
+        cols[4].caption(param_summary)
         if status == "running" and progress_info:
             parts = progress_info.strip().split("/")
             done_val = int(parts[0]) if parts[0].isdigit() else 0
             pct = done_val / target_episodes if target_episodes > 0 else 0
-            cols[4].caption(status_display)
-            cols[4].progress(min(pct, 1.0))
-            cols[4].caption(progress_info)
+            cols[5].caption(status_display)
+            cols[5].progress(min(pct, 1.0))
+            cols[5].caption(progress_info)
         else:
-            cols[4].caption(status_display)
-        cols[5].caption(metric_str)
-        del_key = f"_del_trial_{trial_num}"
-        if cols[6].button("🗑", key=del_key):
+            cols[5].caption(status_display)
+        cols[6].caption(metric_str)
+        source = run.get("source_trial")
+        cols[7].caption(f"重跑自 #{source}" if source else "")
+        rerun_key = f"_rerun_trial_{trial_num}_{page}"
+        if cols[8].button("▶", key=rerun_key):
+            if isinstance(trial_num, int):
+                _start_rerun([trial_num])
+        del_key = f"_del_trial_{trial_num}_{page}"
+        if cols[9].button("🗑", key=del_key):
             if isinstance(trial_num, int) and status == "running":
                 _kill_port_process(port)
             if isinstance(trial_num, int):
@@ -919,7 +1695,7 @@ def _render_run_monitor():
             _show_log("trials/learner.log")
 
     ep_options = []
-    for run in reversed(runs):
+    for run in runs:
         tn = run.get("trial")
         if isinstance(tn, int):
             ep_file = _TRIALS_DIR / f"trial_{tn:04d}" / "episodes.jsonl"
@@ -952,6 +1728,8 @@ def _render_run_monitor():
 
 def _render_learner_tab():
     st.markdown("### 基于 Optuna 贝叶斯优化的 Beam Search 参数自动寻优")
+
+    _migrate_batches()
 
     summary = _load_summary()
     study = _load_study()
@@ -990,42 +1768,129 @@ def _render_learner_tab():
         st.info("暂无优化数据。在侧边栏配置参数后点击「一键启动参数寻优」。")
 
     if study and len(study.trials) > 0:
-        if st.button("重置数据库（清除所有试验记录）", key="learner_reset_db"):
-            try:
-                optuna.delete_study(
-                    study_name="beam_search", storage=f"sqlite:///{_STUDY_DB}"
-                )
-                for f in _RUNS_DIR.glob("trial_*_run.json"):
-                    f.unlink(missing_ok=True)
-                if _SUMMARY_PATH.exists():
-                    _SUMMARY_PATH.unlink()
-                st.toast("数据库已重置", icon="🗑️")
+        batch_info = _get_batch_info()
+
+        with st.expander("批次管理", expanded=False):
+            if batch_info:
+                selected_batches = []
+                for batch_num in sorted(batch_info.keys()):
+                    info = batch_info[batch_num]
+                    checked = st.checkbox(
+                        f"批次 {batch_num}: {info['count']} 条 "
+                        f"(Trial #{info['min_trial']} - #{info['max_trial']})",
+                        key=f"_batch_sel_{batch_num}",
+                    )
+                    if checked:
+                        selected_batches.append(batch_num)
+
+                if selected_batches:
+                    st.caption(f"已选中 {len(selected_batches)} 个批次")
+                    confirmed = st.checkbox(
+                        f"确认删除选中的 {len(selected_batches)} 个批次",
+                        key="_batch_delete_confirm",
+                    )
+                    if st.button(
+                        f"删除选中的 {len(selected_batches)} 个批次",
+                        disabled=not confirmed,
+                        type="primary" if confirmed else "secondary",
+                        key="_batch_delete_btn",
+                    ):
+                        total = 0
+                        for bn in selected_batches:
+                            info = batch_info[bn]
+                            total += info["count"]
+                            _delete_batch(bn)
+                        st.toast(
+                            f"已删除 {len(selected_batches)} 个批次（{total} 条）",
+                            icon="🗑️",
+                        )
+                        st.rerun()
+            else:
+                st.info("暂无批次信息。")
+
+        col_reset, col_grefresh, col_export = st.columns([3, 1, 1])
+        with col_reset:
+            if st.button("重置数据库（清除所有试验记录）", key="learner_reset_db"):
+                try:
+                    optuna.delete_study(
+                        study_name="beam_search", storage=f"sqlite:///{_STUDY_DB}"
+                    )
+                    for f in _RUNS_DIR.glob("trial_*_run.json"):
+                        f.unlink(missing_ok=True)
+                    for d in _TRIALS_DIR.glob("trial_*"):
+                        if d.is_dir():
+                            shutil.rmtree(d, ignore_errors=True)
+                    if _SUMMARY_PATH.exists():
+                        _SUMMARY_PATH.unlink()
+                    st.toast("数据库已重置", icon="🗑️")
+                    _load_study.clear()
+                    _compute_importance.clear()
+                    _load_trials_from_db.clear()
+                    _load_runs.clear()
+                    _get_batch_info.clear()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"重置失败: {e}")
+        with col_grefresh:
+            if st.button("刷新状态", key="learner_refresh_status"):
                 _load_study.clear()
+                _load_runs.clear()
+                _load_trials_from_db.clear()
+                _compute_importance.clear()
+                _get_batch_info.clear()
                 st.rerun()
-            except Exception as e:
-                st.error(f"重置失败: {e}")
 
     _render_best_params(study, summary)
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        ["优化曲线", "参数分析", "参数关系", "试验记录", "运行状态监测"]
-    )
+    _VIEW_OPTIONS = [
+        "优化曲线",
+        "参数分析",
+        "参数关系",
+        "试验记录",
+        "运行状态监测",
+    ]
+    _VIEW_KEY = "_learner_active_view"
+    if _VIEW_KEY not in st.session_state:
+        st.session_state[_VIEW_KEY] = _VIEW_OPTIONS[0]
 
-    with tab1:
+    active_view = st.radio(
+        "选择视图",
+        _VIEW_OPTIONS,
+        index=_VIEW_OPTIONS.index(st.session_state[_VIEW_KEY]),
+        horizontal=True,
+        key=_VIEW_KEY + "_radio",
+        label_visibility="collapsed",
+    )
+    st.session_state[_VIEW_KEY] = active_view
+
+    if active_view == "优化曲线":
         _plot_objective_history(study)
 
-    with tab2:
-        col_left, col_right = st.columns(2)
+    elif active_view == "参数分析":
+        col_left, col_right = st.columns([3, 2])
         with col_left:
-            _plot_importance(study)
+            left_l, left_r = st.columns(2)
+            with left_l:
+                _plot_importance(study)
+            with left_r:
+                _plot_numeric_correlation(study)
         with col_right:
-            _plot_param_correlation(study)
+            cat_row1_a, cat_row1_b = st.columns(2)
+            with cat_row1_a:
+                _plot_categorical_effect(study, "mode")
+            with cat_row1_b:
+                _plot_categorical_effect(study, "score_mode")
+            cat_row2_a, cat_row2_b = st.columns(2)
+            with cat_row2_a:
+                _plot_categorical_effect(study, "action_strategy")
+            with cat_row2_b:
+                _plot_categorical_effect(study, "enable_backup")
 
-    with tab3:
+    elif active_view == "参数关系":
         _plot_parallel_coordinates(study)
 
-    with tab4:
+    elif active_view == "试验记录":
         _render_trials_table()
 
-    with tab5:
+    elif active_view == "运行状态监测":
         _render_run_monitor()
