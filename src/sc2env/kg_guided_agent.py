@@ -109,9 +109,25 @@ class KGGuidedAgent(SmartAgent):
         self._ep_push_batch_size: int = 5
         self._frame_count: int = 0
         self._status_push_interval: int = 50
+        self._ranked_actions: List[str] = []
+        self._exploration_targets: Dict[int, str] = {}
+        self._exploration_active: bool = False
+        self._exploration_trace: List[dict] = []
+
+        self._log_interval: int = 50
+        self._log_counters: Dict[str, int] = {
+            "nid_none": 0,
+            "fallback": 0,
+            "kg_plan": 0,
+            "kg_follow": 0,
+            "diverge": 0,
+            "total": 0,
+        }
 
         self._local_result_dir: Optional[str] = None
         self._local_completed: int = 0
+
+        self._plan_log_file = None
 
         if initial_bktree_data is not None:
             self._load_bktree_from_data(initial_bktree_data)
@@ -304,11 +320,14 @@ class KGGuidedAgent(SmartAgent):
 
     def _get_plan_from_beam(
         self, state_id: int, lookahead_steps: int
-    ) -> Tuple[Optional[str], List[str], List[int], List[Dict], List[Dict]]:
+    ) -> Tuple[Optional[str], List[str], List[int], List[Dict], List[Dict], List[str]]:
         from src.decision.kg_beam_search import plan_action
 
         if self.kg is None or self.transitions is None:
-            return None, [], [], [], []
+            _dbg = f"[PLAN-DEBUG] early return: kg={self.kg is None}, transitions={self.transitions is None}"
+            self._write_plan_log(_dbg)
+            print(_dbg, flush=True)
+            return None, [], [], [], [], []
 
         plan = plan_action(
             self.kg,
@@ -327,7 +346,7 @@ class KGGuidedAgent(SmartAgent):
         if plan.recommended_action is None:
             self._all_beam_states = set()
             self._backup_continuations = {}
-            return None, [], [], [], []
+            return None, [], [], [], [], []
 
         beam_dicts = []
         for r in plan.beam_results:
@@ -396,12 +415,27 @@ class KGGuidedAgent(SmartAgent):
                 }
             )
 
+        finetune_model = self._beam_params.get("finetune_model")
+        if finetune_model is not None and plan.action_plan:
+            threshold = self._beam_params.get("finetune_threshold", 0.4)
+            dm = self._dist_matrix
+            for i, (sid, ac) in enumerate(zip(plan.planned_states, plan.action_plan)):
+                ft_ranked = finetune_model.rank_actions_by_finetune(sid, dm)
+                if not ft_ranked:
+                    continue
+                best_ft = ft_ranked[0]
+                if best_ft and best_ft != ac:
+                    score = finetune_model.replacement_score(sid, ac)
+                    if score < threshold:
+                        plan.action_plan[i] = best_ft
+
         return (
             plan.recommended_action,
             plan.action_plan,
             plan.planned_states,
             beam_dicts,
             beam_paths,
+            plan.ranked_actions,
         )
 
     def _local_decide(self, state_id: int) -> Tuple[Optional[str], str, Optional[Dict]]:
@@ -472,13 +506,16 @@ class KGGuidedAgent(SmartAgent):
 
         if self._plan_idx >= len(self._action_plan):
             try:
-                first_action, actions, states, beam_dicts, beam_paths = (
+                first_action, actions, states, beam_dicts, beam_paths, ranked = (
                     self._get_plan_from_beam(state_id, lookahead)
                 )
                 if not actions:
+                    _msg = f"[PLAN] nid={state_id} trigger={'diverge' if is_diverge else 'exhausted'} -> fallback (empty plan)"
+                    self._write_plan_log(_msg)
                     return None, "fallback", None
                 self._action_plan = actions
                 self._planned_states = states
+                self._ranked_actions = ranked
                 self._plan_idx = 0
                 plan_snap = {
                     "state_id": state_id,
@@ -490,14 +527,53 @@ class KGGuidedAgent(SmartAgent):
                     "trigger": "diverge" if is_diverge else "exhausted",
                 }
                 self._last_plan_snap = plan_snap
-            except Exception:
+                _top3 = ranked[:3] if ranked else []
+                _ap = actions[:3] if actions else []
+                _msg = f"[PLAN] nid={state_id} trigger={'diverge' if is_diverge else 'exhausted'} plan={_ap} ranked={_top3}"
+                self._write_plan_log(_msg)
+            except Exception as _pe:
+                _msg = f"[PLAN] nid={state_id} -> fallback (exception: {_pe})"
+                self._write_plan_log(_msg)
                 return None, "fallback", None
 
         action = self._action_plan[self._plan_idx]
         if self._plan_idx == 0:
-            event_type = "diverge" if is_diverge else "kg_plan"
-        else:
-            event_type = "kg_follow"
+            masked = self._beam_params.get("masked_actions", [])
+            if masked and action in masked:
+                _orig = action
+                ranked = getattr(self, "_ranked_actions", [])
+                for ra in ranked:
+                    if ra not in masked:
+                        action = ra
+                        break
+                else:
+                    action = self._resolve_action(self._fallback_action)
+                    if action:
+                        action_code = (
+                            "4" + chr(ord("a") + self.actions.index(action))
+                            if action in self.actions
+                            else action
+                        )
+                        action = action_code
+                _msg = f"[MASK] nid={state_id} original={_orig} -> replacement={action}"
+                self._write_plan_log(_msg)
+            if self._plan_idx == 0:
+                event_type = "diverge" if is_diverge else "kg_plan"
+            else:
+                event_type = "kg_follow"
+
+        if (
+            self._exploration_active
+            and nid is not None
+            and nid in self._exploration_targets
+        ):
+            action = self._exploration_targets[nid]
+            self._exploration_trace.append({"state": nid, "action": action})
+            event_type = "exploration"
+            print(f"[EXPLORATION] nid={nid} forced_action={action}", flush=True)
+            if not self._exploration_targets:
+                self._exploration_active = False
+
         self._plan_idx += 1
         return action, event_type, self._last_plan_snap
 
@@ -531,6 +607,7 @@ class KGGuidedAgent(SmartAgent):
                         "episode_id": ep.get("episode_id", 0),
                         "result": ep.get("result", "Unknown"),
                         "score": ep.get("score", 0),
+                        "frames": ep.get("frames", []),
                     }
                     if trial_number is not None:
                         record["trial_number"] = trial_number
@@ -549,6 +626,23 @@ class KGGuidedAgent(SmartAgent):
                 pass
         self._ep_batch = []
 
+    def _write_plan_log(self, msg: str) -> None:
+        if self._plan_log_file is None:
+            plan_log_path = self._beam_params.get("plan_log_path")
+            if plan_log_path:
+                try:
+                    self._plan_log_file = open(
+                        str(plan_log_path), "w", encoding="utf-8"
+                    )
+                except Exception:
+                    pass
+        if self._plan_log_file is not None:
+            try:
+                self._plan_log_file.write(msg + "\n")
+                self._plan_log_file.flush()
+            except Exception:
+                pass
+
     def step(self, obs, env):
         from pysc2.lib import actions as sc2_actions
 
@@ -565,6 +659,12 @@ class KGGuidedAgent(SmartAgent):
                 self._beam_params.update(new_params)
                 if "trial_number" in new_params:
                     self.bridge.confirm_params(new_params["trial_number"])
+                if "exploration_targets" in new_params:
+                    self._exploration_targets = {
+                        int(k): v for k, v in new_params["exploration_targets"].items()
+                    }
+                    self._exploration_active = bool(self._exploration_targets)
+                    self._exploration_trace = []
         except Exception:
             pass
 
@@ -741,6 +841,24 @@ class KGGuidedAgent(SmartAgent):
         self._last_action_executed = action_to_execute
         self._record_action(state_cluster, action_to_execute, action_source)
 
+        if self._mode != "replay":
+            c = self._log_counters
+            c["total"] += 1
+            if nid is None:
+                c["nid_none"] += 1
+            key = action_source if action_source in c else "fallback"
+            c[key] = c.get(key, 0) + 1
+            if c["total"] % self._log_interval == 0:
+                print(
+                    f"[SUMMARY] frames={c['total']} | "
+                    f"nid_none={c['nid_none']} | "
+                    f"fallback={c.get('fallback', 0)} | "
+                    f"kg_plan={c.get('kg_plan', 0)} | "
+                    f"kg_follow={c.get('kg_follow', 0)} | "
+                    f"diverge={c.get('diverge', 0)}",
+                    flush=True,
+                )
+
         if (my_units or enemy_units) and not (
             self._mode == "replay"
             and self._replay_per_ep > 0
@@ -775,6 +893,18 @@ class KGGuidedAgent(SmartAgent):
         end_flag = self.end_game_flag
         if end_flag and not self._prev_end_game_flag:
             if self._ep_history:
+                if self._mode != "replay":
+                    c = self._log_counters
+                    print(
+                        f"[EP-END] ep={self.ctx.episode_count if self.ctx else '?'} "
+                        f"result={self.end_game_state} frames={c['total']} | "
+                        f"nid_none={c['nid_none']} fallback={c.get('fallback', 0)} "
+                        f"kg_plan={c.get('kg_plan', 0)} kg_follow={c.get('kg_follow', 0)} "
+                        f"diverge={c.get('diverge', 0)}",
+                        flush=True,
+                    )
+                    for k in self._log_counters:
+                        self._log_counters[k] = 0
                 if self.ctx:
                     self.ctx.episode_count += 1
                 ep_id = self.ctx.episode_count if self.ctx else 0

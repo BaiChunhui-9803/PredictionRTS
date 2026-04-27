@@ -43,6 +43,9 @@ search_space:
   backup_distance_threshold:
   - 0.0
   - 1.0
+  masked_count:
+  - 0
+  - 3
 objective:
   win_rate_weight: 0.8
   avg_score_weight: 0.2

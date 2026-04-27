@@ -21,6 +21,7 @@ def _render_live_game_sidebar(kg_entry: Optional[Dict] = None):
     kg_data_dir = kg_entry.get("data_dir", "") if kg_entry else ""
     if kg_file:
         st.caption(f"KG: {kg_name}")
+        st.caption(f"路径: cache/knowledge_graph/{kg_file}")
         if kg_data_dir:
             st.caption(f"路径: {kg_data_dir}/bktree/")
             import json, glob as _glob

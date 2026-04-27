@@ -4,6 +4,7 @@ import sys
 import shutil
 import subprocess
 import time
+import datetime
 import requests as _requests
 from pathlib import Path
 from typing import Optional, Dict
@@ -357,11 +358,121 @@ def _clear_all_cache():
         _load_trials_from_db,
         _load_runs,
         _get_batch_info,
+        _load_finetune_runs,
     ):
         try:
             fn.clear()
         except Exception:
             pass
+
+
+def _export_all_data():
+    if not _STUDY_DB.exists():
+        st.toast("无数据可导出")
+        return None
+    import sqlite3 as _sqlite
+
+    try:
+        db = _sqlite.connect(str(_STUDY_DB))
+        cur = db.cursor()
+        cur.execute("""
+            SELECT t.number, t.state, tv.value
+            FROM trials t
+            LEFT JOIN trial_values tv ON t.trial_id = tv.trial_id
+            ORDER BY t.number
+        """)
+        trial_values_rows = cur.fetchall()
+
+        cur.execute("""
+            SELECT t.number, tp.param_name, tp.param_value
+            FROM trials t
+            JOIN trial_params tp ON t.trial_id = tp.trial_id
+            ORDER BY t.number
+        """)
+        params_rows = cur.fetchall()
+
+        cur.execute("""
+            SELECT t.number, tua.key, tua.value_json
+            FROM trials t
+            JOIN trial_user_attributes tua ON t.trial_id = tua.trial_id
+            ORDER BY t.number
+        """)
+        attrs_rows = cur.fetchall()
+        db.close()
+    except Exception:
+        st.toast("导出失败：数据库读取错误")
+        return None
+
+    params_map: dict = {}
+    for num, pname, pval in params_rows:
+        params_map.setdefault(num, {})[pname] = pval
+
+    attrs_map: dict = {}
+    for num, key, val_json in attrs_rows:
+        attrs_map.setdefault(num, {})[key] = val_json
+
+    value_map: dict = {}
+    for num, state, val in trial_values_rows:
+        if val is not None:
+            value_map[num] = val
+
+    trials = []
+    for num in sorted(
+        set(list(params_map.keys()) + list(attrs_map.keys()) + list(value_map.keys()))
+    ):
+        params = params_map.get(num, {})
+        raw_attrs = attrs_map.get(num, {})
+        attrs = {}
+        for k, v in raw_attrs.items():
+            try:
+                attrs[k] = json.loads(v)
+            except Exception:
+                attrs[k] = v
+
+        trial_data = {
+            "trial": num,
+            "objective": value_map.get(num),
+            "params": params,
+            "metrics": {
+                "win_rate": attrs.get("win_rate", 0),
+                "avg_score": attrs.get("avg_score", 0),
+                "score_std": attrs.get("score_std", 0),
+                "stability": attrs.get("stability", 0),
+                "num_episodes": attrs.get("num_episodes", 0),
+            },
+            "user_attrs": {
+                "status": attrs.get("status"),
+                "batch": attrs.get("batch"),
+                "source_trial": attrs.get("source_trial"),
+                "penalty_factor": attrs.get("penalty_factor"),
+                "result_file": attrs.get("result_file"),
+            },
+        }
+        trials.append(trial_data)
+
+    export = {
+        "export_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "total_trials": len(trials),
+        "trials": trials,
+    }
+    return json.dumps(export, ensure_ascii=False, indent=2)
+
+
+def _render_export_button():
+    if "learner_export_data" not in st.session_state:
+        st.session_state.learner_export_data = None
+    if st.button("导出数据", key="learner_export_btn"):
+        data = _export_all_data()
+        if data:
+            st.session_state.learner_export_data = data
+    if st.session_state.learner_export_data:
+        st.download_button(
+            "下载 JSON",
+            data=st.session_state.learner_export_data.encode("utf-8"),
+            file_name=f"learner_trials_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json",
+            key="learner_download_btn",
+        )
 
 
 def _start_rerun(trial_numbers):
@@ -586,6 +697,38 @@ def _render_learner_sidebar(kg_entry: Optional[Dict] = None):
 
     if kg_file:
         st.caption(f"KG: {kg_name}")
+        st.caption(f"路径: cache/knowledge_graph/{kg_file}")
+        if kg_data_dir:
+            st.caption(f"数据目录: {kg_data_dir}")
+            import json as _json
+            import glob as _glob
+
+            _bkt_dir = ROOT_DIR / kg_data_dir / "bktree"
+            _pri = _bkt_dir / "primary_bktree.json"
+            _pri_cnt = 0
+            if _pri.exists():
+                try:
+                    _d = _json.load(open(str(_pri), "r"))
+                    _stk = [_d]
+                    while _stk:
+                        _n = _stk.pop()
+                        _pri_cnt += 1
+                        _stk.extend(_n.get("children", {}).values())
+                except Exception:
+                    pass
+            _sec_files = sorted(_glob.glob(str(_bkt_dir / "secondary_bktree_*.json")))
+            _sec_cnt = len(_sec_files)
+            _sn_path = ROOT_DIR / kg_data_dir / "graph" / "state_node.txt"
+            _sn_cnt = 0
+            if _sn_path.exists():
+                try:
+                    _sn_cnt = sum(1 for _ in open(str(_sn_path), "r") if _.strip())
+                except Exception:
+                    pass
+            with st.expander("BKTree 详情", expanded=False):
+                st.caption(f"Primary 节点: {_pri_cnt}")
+                st.caption(f"Secondary 树: {_sec_cnt}")
+                st.caption(f"State 映射: {_sn_cnt} 条")
 
     if "learner_proc" in st.session_state:
         proc = st.session_state.learner_proc
@@ -687,6 +830,61 @@ def _render_learner_sidebar(kg_entry: Optional[Dict] = None):
     )
 
     st.divider()
+    st.markdown("**动作屏蔽**")
+    _MASKED_ACTION_OPTIONS = {
+        "4a": "4a - ATK_nearest",
+        "4b": "4b - ATK_clu_nearest",
+        "4c": "4c - ATK_nearest_weakest",
+        "4d": "4d - ATK_clu_nearest_weakest",
+        "4e": "4e - ATK_threatening",
+        "4f": "4f - DEF_clu_nearest",
+        "4g": "4g - MIX_gather",
+        "4h": "4h - MIX_lure",
+        "4i": "4i - MIX_sacrifice_lure",
+        "4j": "4j - do_randomly",
+        "4k": "4k - do_nothing",
+    }
+    st.multiselect(
+        "手动屏蔽动作（覆盖寻优参数）",
+        options=list(_MASKED_ACTION_OPTIONS.keys()),
+        format_func=lambda x: _MASKED_ACTION_OPTIONS.get(x, x),
+        key="learner_masked_actions",
+        help="选择后，决策时将跳过这些动作，按 ranked_actions 顺位选下一个",
+    )
+
+    st.divider()
+    st.markdown("**状态微调机**")
+
+    use_finetune = st.toggle(
+        "启用状态微调机",
+        value=False,
+        key="learner_use_finetune",
+        help="在规划阶段对低置信度状态的动作选择进行修正",
+    )
+
+    if use_finetune:
+        _FINETUNE_MODEL_PATH = _RESULTS_DIR / "finetune_model.pkl"
+        model_options = ["(无模型)"]
+        if _FINETUNE_MODEL_PATH.exists():
+            model_options.append("finetune_model.pkl")
+
+        st.selectbox(
+            "选择模型",
+            model_options,
+            key="learner_finetune_model",
+        )
+
+        st.slider(
+            "微调阈值",
+            0.1,
+            1.0,
+            0.4,
+            step=0.05,
+            key="learner_finetune_threshold",
+            help="replacement_score 低于此值时用微调模型替换 beam search 建议",
+        )
+
+    st.divider()
 
     if st.button(
         "查看/编辑搜索空间", use_container_width=True, key="learner_toggle_space"
@@ -727,6 +925,10 @@ def _render_learner_sidebar(kg_entry: Optional[Dict] = None):
         if study:
             cmd.append("--resume")
 
+        manual_masked = st.session_state.get("learner_masked_actions", [])
+        if manual_masked:
+            cmd.extend(["--masked_actions", ",".join(manual_masked)])
+
         _save_obj_config(w_win, w_score, alpha, cap)
 
         _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -754,6 +956,161 @@ def _render_learner_sidebar(kg_entry: Optional[Dict] = None):
         st.toast(f"参数寻优已启动 (PID: {p.pid})", icon="🚀")
         time.sleep(1)
         st.rerun()
+
+
+def _get_filtered_trials(study, batch_selection="all"):
+    completed = _get_completed_trials(study, min_count=1)
+    if not completed or batch_selection == "all":
+        return completed
+    try:
+        target_batch = int(batch_selection)
+    except (ValueError, TypeError):
+        return completed
+    return [t for t in completed if t.user_attrs.get("batch") == target_batch]
+
+
+def _render_batch_selector(key="_analysis_batch"):
+    batch_info = _get_batch_info()
+    if not batch_info:
+        return "all"
+    options = ["all"] + [str(b) for b in sorted(batch_info.keys())]
+    labels = ["全部"] + [
+        f"Batch {b} ({batch_info[b]['count']}轮)" for b in sorted(batch_info.keys())
+    ]
+    idx = options.index(st.session_state.get(key, "all"))
+    sel = st.radio(
+        "分析范围",
+        options,
+        index=idx,
+        format_func=lambda x: labels[options.index(x)],
+        horizontal=True,
+        key=key,
+    )
+    return sel
+
+
+def _render_conclusion_panel(filtered_trials):
+    if not filtered_trials:
+        st.info("无符合条件的数据。")
+        return
+    filtered_trials.sort(key=lambda t: t.value if t.value else 0, reverse=True)
+    best = filtered_trials[0]
+    threshold = filtered_trials[int(len(filtered_trials) * 0.9)]
+    top_pct = filtered_trials[: max(1, int(len(filtered_trials) * 0.1))]
+    threshold_val = threshold.value if threshold.value else 0
+
+    st.subheader("结论")
+    st.caption(
+        f"基于 {len(filtered_trials)} 轮试验，Top-10% 阈值 objective >= {threshold_val:.4f}"
+    )
+
+    bc = st.columns(3)
+    bc[0].metric("最佳 Objective", f"{best.value:.4f}", f"Trial #{best.number}")
+    wr = best.user_attrs.get("win_rate", 0)
+    sc = best.user_attrs.get("avg_score", 0)
+    bc[1].metric("胜率", f"{wr:.1%}")
+    bc[2].metric("平均得分", f"{sc:.1f}")
+
+    st.markdown("**最优参数**")
+    pc = st.columns(4)
+    for i, (k, v) in enumerate(best.params.items()):
+        label = _ACTION_STRATEGY_LABELS.get(v, v) if isinstance(v, str) else v
+        with pc[i % 4]:
+            st.metric(k, label)
+
+    st.markdown("**Top-10% 参数区间**")
+    numeric_keys, categorical_keys = _classify_params(top_pct)
+    rows = []
+    for k in numeric_keys:
+        vals = [t.params[k] for t in top_pct if k in t.params]
+        if vals:
+            rows.append(
+                {
+                    "参数": k,
+                    "Min": min(vals),
+                    "Median": sorted(vals)[len(vals) // 2],
+                    "Mean": round(sum(vals) / len(vals), 2),
+                    "Max": max(vals),
+                }
+            )
+    if rows:
+        import pandas as _pd
+
+        st.dataframe(_pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    for k in categorical_keys:
+        dist = {}
+        for t in top_pct:
+            v = t.params.get(k, "")
+            dist[v] = dist.get(v, 0) + 1
+        if dist:
+            label_map = _ACTION_STRATEGY_LABELS if k == "action_strategy" else {}
+            txt = ", ".join(
+                f"{label_map.get(v, v)}: {c}"
+                for v, c in sorted(dist.items(), key=lambda x: -x[1])
+            )
+            st.markdown(f"**{k}**: {txt}")
+
+    st.markdown("**关键发现**")
+    importance = _compute_importance()
+    if importance:
+        sorted_imp = sorted(importance.items(), key=lambda x: -x[1])
+        top_param = sorted_imp[0][0] if sorted_imp else ""
+        top_vals = [t.params[top_param] for t in top_pct if top_param in t.params]
+        if top_vals:
+            median_val = sorted(top_vals)[len(top_vals) // 2]
+            st.info(
+                f"最关键参数: **{top_param}** (重要性 {sorted_imp[0][1]:.1%})，Top-10% 中位数: {median_val}"
+            )
+        top3 = ", ".join(f"{k} ({v:.1%})" for k, v in sorted_imp[:3])
+        st.caption(f"参数重要性排名: {top3}")
+
+    mask_mc = [t.params.get("masked_count", 0) for t in top_pct]
+    if mask_mc:
+        from collections import Counter
+
+        mc_mode = Counter(mask_mc).most_common(1)[0]
+        mask_1_vals = [
+            t.params.get("mask_1")
+            for t in top_pct
+            if t.params.get("masked_count", 0) >= 2
+            and t.params.get("mask_1") is not None
+        ]
+        mask_0_vals = [
+            t.params.get("mask_0")
+            for t in top_pct
+            if t.params.get("masked_count", 0) >= 2
+            and t.params.get("mask_0") is not None
+        ]
+        m1_mode = Counter(mask_1_vals).most_common(1)[0][0] if mask_1_vals else "N/A"
+        m0_range = f"{min(mask_0_vals)}-{max(mask_0_vals)}" if mask_0_vals else "N/A"
+        st.info(
+            f"最优 mask 模式: **masked_count={mc_mode[0]}** ({mc_mode[1]}/{len(top_pct)} Top-10%), "
+            f"mask_1={m1_mode}, mask_0={m0_range}"
+        )
+
+    if st.button("导出最优配置到 learner_config.yaml", key="export_best_config"):
+        try:
+            import yaml as _yaml
+
+            cfg_path = ROOT_DIR / "configs" / "learner_config.yaml"
+            if cfg_path.exists():
+                with open(str(cfg_path), "r", encoding="utf-8") as f:
+                    cfg = _yaml.safe_load(f)
+                if "game" not in cfg:
+                    cfg["game"] = {}
+                cfg["game"]["best_params"] = dict(best.params)
+                cfg["game"]["best_objective"] = float(best.value)
+                cfg["game"]["best_trial"] = best.number
+                with open(str(cfg_path), "w", encoding="utf-8") as f:
+                    _yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
+                st.success(f"已导出到 {cfg_path}")
+            else:
+                st.error("learner_config.yaml 不存在")
+        except Exception as e:
+            st.error(f"导出失败: {e}")
+
+    st.divider()
 
 
 def _plot_objective_history(study):
@@ -916,8 +1273,8 @@ def _get_trial_metrics(t) -> dict:
     }
 
 
-def _plot_numeric_correlation(study):
-    completed = _get_completed_trials(study)
+def _plot_numeric_correlation(study, batch_key="all"):
+    completed = _get_filtered_trials(study, batch_key)
     if len(completed) < 5:
         st.info("完成的试验不足 5 轮。")
         return
@@ -998,8 +1355,8 @@ def _plot_numeric_correlation(study):
     st.plotly_chart(fig, use_container_width=True)
 
 
-def _plot_categorical_effect(study, cat_key):
-    completed = _get_completed_trials(study, min_count=3)
+def _plot_categorical_effect(study, cat_key, batch_key="all"):
+    completed = _get_filtered_trials(study, batch_key)
     if len(completed) < 3:
         st.info("试验数据不足。")
         return
@@ -1105,15 +1462,11 @@ def _plot_categorical_effect(study, cat_key):
     st.plotly_chart(fig, use_container_width=True)
 
 
-def _plot_parallel_coordinates(study):
+def _plot_parallel_coordinates(study, batch_key="all"):
     if not study:
         return
 
-    completed = [
-        t
-        for t in study.trials
-        if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
-    ]
+    completed = _get_filtered_trials(study, batch_key)
     if len(completed) < 3:
         st.info("试验数据不足。")
         return
@@ -1193,6 +1546,199 @@ def _plot_parallel_coordinates(study):
         font=dict(color="#333", size=14),
     )
     st.plotly_chart(fig, use_container_width=True)
+
+
+def _plot_slice(study, batch_key="all"):
+    if not study:
+        return
+    completed = _get_filtered_trials(study, batch_key)
+    if len(completed) < 5:
+        st.info("试验数据不足（至少 5 轮）。")
+        return
+    numeric_keys, categorical_keys = _classify_params(completed)
+    n_params = len(numeric_keys) + len(categorical_keys)
+    if n_params == 0:
+        st.info("无可显示的参数。")
+        return
+    n_rows = (n_params + 1) // 2
+    from plotly.subplots import make_subplots
+
+    specs = [[{}, {}] for _ in range(n_rows)]
+    fig = make_subplots(
+        rows=n_rows,
+        cols=2,
+        specs=specs,
+        subplot_titles=[k for k in numeric_keys + categorical_keys],
+    )
+    for i, k in enumerate(numeric_keys):
+        vals = [t.params[k] for t in completed if k in t.params]
+        objs = [t.value for t in completed if k in t.params and t.value is not None]
+        fig.add_trace(
+            go.Scatter(
+                x=vals,
+                y=objs,
+                mode="markers",
+                marker=dict(size=4, opacity=0.6, color="#636EFA"),
+                name=k,
+                showlegend=False,
+            ),
+            row=(i // 2) + 1,
+            col=(i % 2) + 1,
+        )
+    for j, k in enumerate(categorical_keys):
+        offset = len(numeric_keys)
+        idx = offset + j
+        label_map = _ACTION_STRATEGY_LABELS if k == "action_strategy" else {}
+        groups = {}
+        for t in completed:
+            v = t.params.get(k, "")
+            if v not in groups:
+                groups[v] = []
+            if t.value is not None:
+                groups[v].append(t.value)
+        x_vals = []
+        y_vals = []
+        for v in sorted(groups.keys()):
+            x_vals.append(label_map.get(v, v))
+            y_vals.append(groups[v])
+        fig.add_trace(
+            go.Box(
+                y=y_vals,
+                x=x_vals,
+                name=k,
+                boxpoints="outliers",
+                marker=dict(size=3, opacity=0.6),
+                showlegend=False,
+            ),
+            row=(idx // 2) + 1,
+            col=(idx % 2) + 1,
+        )
+    fig.update_layout(
+        height=250 * n_rows,
+        margin=dict(l=60, r=20, t=30, b=30),
+        title_text="参数切片分析",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _compute_pair_importance(completed, importance):
+    numeric_keys, _ = _classify_params(completed)
+    all_pairs = []
+    for i in range(len(numeric_keys)):
+        for j in range(i + 1, len(numeric_keys)):
+            p1, p2 = numeric_keys[i], numeric_keys[j]
+            imp = importance.get(p1, 0) + importance.get(p2, 0)
+            all_pairs.append((p1, p2, imp))
+    all_pairs.sort(key=lambda x: -x[2])
+    return all_pairs
+
+
+def _plot_contour(study, batch_key="all"):
+    if not study:
+        return []
+    completed = _get_filtered_trials(study, batch_key)
+    if len(completed) < 10:
+        st.info("试验数据不足（至少 10 轮）。")
+        return []
+    importance = _compute_importance() or {}
+    all_pairs = _compute_pair_importance(completed, importance)
+    if not all_pairs:
+        st.info("无可用参数对。")
+        return []
+    cols = st.columns(6)
+    for idx, (p1, p2, imp_sum) in enumerate(all_pairs):
+        if idx % 6 == 0:
+            cols = st.columns(6)
+        with cols[idx % 6]:
+            x = [t.params[p1] for t in completed if p1 in t.params]
+            y = [t.params[p2] for t in completed if p2 in t.params]
+            z = [
+                t.value
+                for t in completed
+                if p1 in t.params and p2 in t.params and t.value is not None
+            ]
+            if len(x) < 3 or len(z) < 3:
+                continue
+            fig = go.Figure(
+                go.Histogram2dContour(
+                    x=x,
+                    y=y,
+                    z=z,
+                    colorscale="Viridis",
+                    ncontours=15,
+                    contours_coloring="heatmap",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=y,
+                    mode="markers",
+                    marker=dict(size=3, opacity=0.4, color="#333"),
+                    showlegend=False,
+                )
+            )
+            fig.update_layout(
+                height=300,
+                margin=dict(l=45, r=10, t=30, b=25),
+                title_text=f"{p1} vs {p2}<br><sub>imp={imp_sum:.1%}</sub>",
+            )
+            fig.update_xaxes(title_text=p1)
+            fig.update_yaxes(title_text=p2)
+            st.plotly_chart(fig, use_container_width=True)
+    return all_pairs
+
+
+def _plot_mask_heatmap(study, batch_key="all"):
+    completed = _get_filtered_trials(study, batch_key)
+    masked = [
+        t
+        for t in completed
+        if t.params.get("masked_count", 0) >= 2
+        and t.params.get("mask_0") is not None
+        and t.params.get("mask_1") is not None
+        and t.value is not None
+    ]
+    if len(masked) < 5:
+        st.caption("mask 组合数据不足。")
+        return
+    grid = {}
+    for t in masked:
+        m0 = t.params["mask_0"]
+        m1 = t.params["mask_1"]
+        key = (m0, m1)
+        if key not in grid:
+            grid[key] = []
+        grid[key].append(t.value)
+    x_labels = sorted(set(m0 for m0, _ in grid.keys()))
+    y_labels = sorted(set(m1 for _, m1 in grid.keys()))
+    z_data = []
+    for m1 in y_labels:
+        row = []
+        for m0 in x_labels:
+            vals = grid.get((m0, m1), [])
+            row.append(round(sum(vals) / len(vals), 3) if vals else None)
+        z_data.append(row)
+    fig = go.Figure(
+        go.Heatmap(
+            z=z_data,
+            x=[f"动作{v}" for v in x_labels],
+            y=[f"动作{v}" for v in y_labels],
+            colorscale="Viridis",
+            text=[[f"{v:.3f}" if v else "" for v in row] for row in z_data],
+            texttemplate="%{text}",
+            textfont=dict(size=10),
+            hovertemplate="mask_0=%{x}<br>mask_1=%{y}<br>obj=%{z}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        height=340,
+        margin=dict(l=50, r=20, t=10, b=40),
+        xaxis_title="mask_0",
+        yaxis_title="mask_1",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption("热力图: mask_0 × mask_1 的平均 objective（仅 masked_count>=2）")
 
 
 def _render_best_params(study, summary):
@@ -1673,7 +2219,12 @@ def _render_run_monitor():
             cols[5].caption(status_display)
         cols[6].caption(metric_str)
         source = run.get("source_trial")
-        cols[7].caption(f"重跑自 #{source}" if source else "")
+        remark = ""
+        if source:
+            remark = f"重跑自 #{source}"
+        if p.get("exploration_targets"):
+            remark = ("微调训练 " + remark).strip()
+        cols[7].caption(remark)
         rerun_key = f"_rerun_trial_{trial_num}_{page}"
         if cols[8].button("▶", key=rerun_key):
             if isinstance(trial_num, int):
@@ -1839,6 +2390,8 @@ def _render_learner_tab():
                 _compute_importance.clear()
                 _get_batch_info.clear()
                 st.rerun()
+        with col_export:
+            _render_export_button()
 
     _render_best_params(study, summary)
 
@@ -1848,49 +2401,518 @@ def _render_learner_tab():
         "参数关系",
         "试验记录",
         "运行状态监测",
+        "微调训练",
     ]
     _VIEW_KEY = "_learner_active_view"
-    if _VIEW_KEY not in st.session_state:
-        st.session_state[_VIEW_KEY] = _VIEW_OPTIONS[0]
-
     active_view = st.radio(
         "选择视图",
         _VIEW_OPTIONS,
-        index=_VIEW_OPTIONS.index(st.session_state[_VIEW_KEY]),
         horizontal=True,
-        key=_VIEW_KEY + "_radio",
+        key=_VIEW_KEY,
         label_visibility="collapsed",
     )
-    st.session_state[_VIEW_KEY] = active_view
 
     if active_view == "优化曲线":
         _plot_objective_history(study)
 
     elif active_view == "参数分析":
+        batch_key = _render_batch_selector("_analysis_batch")
+        filtered = _get_filtered_trials(study, batch_key)
+        _render_conclusion_panel(filtered)
         col_left, col_right = st.columns([3, 2])
         with col_left:
             left_l, left_r = st.columns(2)
             with left_l:
                 _plot_importance(study)
             with left_r:
-                _plot_numeric_correlation(study)
+                _plot_numeric_correlation(study, batch_key)
         with col_right:
             cat_row1_a, cat_row1_b = st.columns(2)
             with cat_row1_a:
-                _plot_categorical_effect(study, "mode")
+                _plot_categorical_effect(study, "mode", batch_key)
             with cat_row1_b:
-                _plot_categorical_effect(study, "score_mode")
+                _plot_categorical_effect(study, "score_mode", batch_key)
             cat_row2_a, cat_row2_b = st.columns(2)
             with cat_row2_a:
-                _plot_categorical_effect(study, "action_strategy")
+                _plot_categorical_effect(study, "action_strategy", batch_key)
             with cat_row2_b:
-                _plot_categorical_effect(study, "enable_backup")
+                _plot_categorical_effect(study, "enable_backup", batch_key)
+            cat_row3_a, cat_row3_b = st.columns(2)
+            with cat_row3_a:
+                _plot_categorical_effect(study, "masked_count", batch_key)
+            with cat_row3_b:
+                _plot_mask_heatmap(study, batch_key)
 
     elif active_view == "参数关系":
-        _plot_parallel_coordinates(study)
+        batch_key = _render_batch_selector("_relation_batch")
+        _plot_parallel_coordinates(study, batch_key)
+        st.divider()
+        _plot_slice(study, batch_key)
+        with st.expander("参数等高线图", expanded=False):
+            importance = _compute_importance() or {}
+            if importance:
+                top_params = sorted(importance.items(), key=lambda x: -x[1])[:6]
+                imp_txt = ", ".join(f"{k}={v:.1%}" for k, v in top_params)
+                st.caption(f"选择依据（参数重要性，组合重要性=两参数之和）: {imp_txt}")
+                import pandas as _pd
+
+                single_rows = [
+                    {"参数": k, "重要性": f"{v:.1%}"}
+                    for k, v in sorted(importance.items(), key=lambda x: -x[1])
+                ]
+                st.markdown("**单参数重要性**")
+                st.dataframe(
+                    _pd.DataFrame(single_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            all_pairs = _plot_contour(study, batch_key)
+            if all_pairs:
+                import pandas as _pd
+
+                pair_rows = [
+                    {
+                        "排名": i + 1,
+                        "参数对": f"{p1} vs {p2}",
+                        "组合重要性": f"{imp:.1%}",
+                    }
+                    for i, (p1, p2, imp) in enumerate(all_pairs)
+                ]
+                st.markdown(
+                    f"**全部参数对组合重要性（共 {len(all_pairs)} 对，全部已绘制）**"
+                )
+                st.dataframe(
+                    _pd.DataFrame(pair_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
     elif active_view == "试验记录":
         _render_trials_table()
 
     elif active_view == "运行状态监测":
         _render_run_monitor()
+
+    elif active_view == "微调训练":
+        _render_finetune_tab()
+
+
+_FINETUNE_DIR = _RESULTS_DIR / "finetune_runs"
+_FINETUNE_SAMPLES_DIR = _RESULTS_DIR / "finetune_samples"
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _load_finetune_runs():
+    runs = []
+    if not _FINETUNE_DIR.exists():
+        return runs
+    for fp in sorted(_FINETUNE_DIR.glob("finetune_*_run.json")):
+        try:
+            with open(str(fp), "r", encoding="utf-8") as f:
+                runs.append(json.load(f))
+        except Exception:
+            continue
+    return runs
+
+
+def _delete_finetune_run(finetune_id: int):
+    run_json = _FINETUNE_DIR / f"finetune_{finetune_id:04d}_run.json"
+    run_json.unlink(missing_ok=True)
+
+    sample_dir = _FINETUNE_SAMPLES_DIR / f"finetune_{finetune_id:04d}"
+    if sample_dir.is_dir():
+        shutil.rmtree(sample_dir, ignore_errors=True)
+
+    try:
+        _load_finetune_runs.clear()
+    except Exception:
+        pass
+
+
+def _render_finetune_model_overview():
+    model_path = _RESULTS_DIR / "finetune_model.pkl"
+    if not model_path.exists():
+        st.info("尚未训练模型。启动训练后将在此显示模型概览。")
+        return
+
+    try:
+        import pickle
+
+        with open(str(model_path), "rb") as f:
+            model = pickle.load(f)
+        from src.decision.finetune_model import FinetuneModel
+
+        if not isinstance(model, FinetuneModel):
+            st.error("模型文件格式不兼容。")
+            return
+
+        stats = model.get_overall_stats()
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("已探索状态", f"{stats['explored_states']}/{stats['total_states']}")
+        col2.metric("平均置信度", f"{stats['explored_ratio']:.1%}")
+        col3.metric("平均 RS", f"{stats['avg_replacement_score']:.3f}")
+        col4.metric("训练 Episodes", stats["trained_episodes"])
+
+        st.caption(f"最后训练: {stats.get('last_trained', 'N/A')}")
+
+        all_scores = []
+        for sid in model.q_table:
+            for ac in model.q_table[sid]:
+                all_scores.append(model.replacement_score(sid, ac))
+        if all_scores:
+            import plotly.graph_objects as go
+            import numpy as _np
+
+            fig = go.Figure(
+                data=[go.Histogram(x=all_scores, nbinsx=20, marker_color="steelblue")]
+            )
+            fig.update_layout(
+                xaxis_title="Replacement Score",
+                yaxis_title="State-Action Pairs",
+                height=300,
+                margin=dict(l=40, r=20, t=20, b=40),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"加载模型失败: {e}")
+
+
+def _render_finetune_tab():
+    st.subheader("状态微调机")
+
+    col_overview, col_config = st.columns([3, 2])
+    with col_overview:
+        _render_finetune_model_overview()
+
+    with col_config:
+        st.markdown("**训练配置**")
+        top_k = st.number_input("Top-K 参数组合", 1, 20, 5, key="ft_top_k")
+        ep_per_cfg = st.number_input("每组 Episodes", 10, 200, 50, key="ft_ep_per_cfg")
+        explore_budget = st.number_input(
+            "探索预算", 50, 5000, 500, step=50, key="ft_budget"
+        )
+        sigma = st.slider("k-NN sigma", 0.1, 2.0, 0.5, step=0.1, key="ft_sigma")
+        target_visits = st.number_input(
+            "目标探索次数", 3, 100, 10, key="ft_target_visits"
+        )
+        convergence = st.slider(
+            "收敛阈值", 0.3, 0.9, 0.6, step=0.05, key="ft_convergence"
+        )
+
+    st.divider()
+
+    runs = _load_finetune_runs()
+
+    if runs:
+        st.markdown("**训练记录**")
+
+        header_cols = st.columns([0.7, 2, 0.8, 0.8, 1, 1.2, 1.2, 0.8, 0.5])
+        header_labels = [
+            "ID",
+            "Top-K Trials",
+            "Ep/Cfg",
+            "预算",
+            "状态",
+            "时间",
+            "模型指标",
+            "详情",
+            "删除",
+        ]
+        for col, label in zip(header_cols, header_labels):
+            col.caption(f"**{label}**")
+
+        for run in reversed(runs):
+            fid = run.get("finetune_id", "?")
+            status = run.get("status", "unknown")
+            cfg = run.get("config", {})
+            top_trials = run.get("top_trials", [])
+            model_stats = run.get("model_stats", {})
+
+            if status == "running":
+                status_display = "🟢 运行中"
+            elif status == "completed":
+                status_display = "✅ 已完成"
+            elif status == "interrupted":
+                status_display = "🟡 中断"
+            elif status == "no_data":
+                status_display = "⚠️ 无数据"
+            else:
+                status_display = f"❓ {status}"
+
+            top_str = ", ".join(f"#{t}" for t in top_trials[:3])
+            if len(top_trials) > 3:
+                top_str += f" (+{len(top_trials) - 3})"
+
+            metric_str = ""
+            if model_stats:
+                metric_str = (
+                    f"{model_stats.get('explored_states', 0)}/{model_stats.get('total_states', 0)} "
+                    f"| RS {model_stats.get('avg_replacement_score', 0):.3f}"
+                )
+
+            time_str = run.get("start_time", "?")
+            end_time = run.get("end_time", "")
+            if end_time and end_time != time_str:
+                time_str = f"{time_str[:16]}~{end_time[:16]}"
+
+            cols = st.columns([0.7, 2, 0.8, 0.8, 1, 1.2, 1.2, 0.8, 0.5])
+            cols[0].caption(f"#{fid:04d}")
+            cols[1].caption(top_str)
+            cols[2].caption(str(cfg.get("episodes_per_config", "?")))
+            cols[3].caption(str(cfg.get("explore_budget", "?")))
+            cols[4].caption(status_display)
+            cols[5].caption(time_str)
+            cols[6].caption(metric_str if metric_str else "—")
+
+            detail_key = f"ft_detail_{fid}"
+            if cols[7].button("📋", key=detail_key):
+                st.session_state[f"_ft_show_detail_{fid}"] = not st.session_state.get(
+                    f"_ft_show_detail_{fid}", False
+                )
+                st.rerun()
+
+            del_key = f"ft_del_{fid}"
+            if cols[8].button("🗑", key=del_key):
+                _delete_finetune_run(fid)
+                st.toast(f"训练 #{fid:04d} 已删除", icon="🗑️")
+                st.rerun()
+
+            if st.session_state.get(f"_ft_show_detail_{fid}", False):
+                with st.expander(f"训练 #{fid:04d} 详情", expanded=True):
+                    dc1, dc2 = st.columns(2)
+                    with dc1:
+                        st.caption("**配置**")
+                        st.caption(f"Top-K Trials: {top_trials}")
+                        st.caption(
+                            f"Episodes/Config: {cfg.get('episodes_per_config', '?')}"
+                        )
+                        st.caption(f"探索预算: {cfg.get('explore_budget', '?')}")
+                        st.caption(f"Sigma: {cfg.get('sigma', '?')}")
+                        st.caption(f"目标探索次数: {cfg.get('target_visits', '?')}")
+                        st.caption(f"收敛阈值: {cfg.get('convergence_threshold', '?')}")
+                        st.caption(f"胜率阈值: {cfg.get('win_rate_threshold', '?')}")
+                    with dc2:
+                        st.caption("**结果**")
+                        st.caption(f"开始: {run.get('start_time', '?')}")
+                        st.caption(f"结束: {run.get('end_time', '—')}")
+                        if model_stats:
+                            st.caption(
+                                f"已探索: {model_stats.get('explored_states', 0)}/{model_stats.get('total_states', 0)}"
+                            )
+                            st.caption(
+                                f"探索比例: {model_stats.get('explored_ratio', 0):.2%}"
+                            )
+                            st.caption(
+                                f"平均 RS: {model_stats.get('avg_replacement_score', 0):.4f}"
+                            )
+                            st.caption(
+                                f"训练 Episodes: {model_stats.get('trained_episodes', 0)}"
+                            )
+                        else:
+                            st.caption("无模型统计")
+
+                    sample_dir = _FINETUNE_SAMPLES_DIR / f"finetune_{fid:04d}"
+                    if sample_dir.is_dir():
+                        sc1, sc2 = st.columns(2)
+                        with sc1:
+                            base_ep = sample_dir / "base_episodes.jsonl"
+                            if base_ep.exists():
+                                try:
+                                    line_count = sum(
+                                        1 for _ in open(str(base_ep), encoding="utf-8")
+                                    )
+                                    st.caption(f"base_episodes.jsonl ({line_count} 行)")
+                                except Exception:
+                                    st.caption("base_episodes.jsonl")
+                                if st.button(
+                                    "查看基准样本",
+                                    key=f"ft_base_{fid}",
+                                    use_container_width=True,
+                                ):
+                                    _show_finetune_jsonl(
+                                        base_ep, f"基准样本 (#{fid:04d})"
+                                    )
+                        with sc2:
+                            explore_ep = sample_dir / "explore_episodes.jsonl"
+                            if explore_ep.exists():
+                                try:
+                                    line_count = sum(
+                                        1
+                                        for _ in open(str(explore_ep), encoding="utf-8")
+                                    )
+                                    st.caption(
+                                        f"explore_episodes.jsonl ({line_count} 行)"
+                                    )
+                                except Exception:
+                                    st.caption("explore_episodes.jsonl")
+                                if st.button(
+                                    "查看探索样本",
+                                    key=f"ft_explore_{fid}",
+                                    use_container_width=True,
+                                ):
+                                    _show_finetune_jsonl(
+                                        explore_ep, f"探索样本 (#{fid:04d})"
+                                    )
+
+                    qc_path = sample_dir / "q_table_snapshot.json"
+                    if qc_path.exists():
+                        if st.button(
+                            "查看 Q-Table 快照",
+                            key=f"ft_qtable_{fid}",
+                            use_container_width=True,
+                        ):
+                            _show_qtable_snapshot(qc_path)
+
+                    progress_path = sample_dir / "progress.json"
+                    if progress_path.exists():
+                        if st.button(
+                            "查看训练进度",
+                            key=f"ft_progress_{fid}",
+                            use_container_width=True,
+                        ):
+                            _show_finetune_progress(progress_path)
+
+                    trainer_log = sample_dir / "trainer.log"
+                    if trainer_log.exists():
+                        if st.button(
+                            "查看训练日志",
+                            key=f"ft_trainerlog_{fid}",
+                            use_container_width=True,
+                        ):
+                            _show_log(
+                                f"finetune_samples/finetune_{fid:04d}/trainer.log"
+                            )
+    else:
+        st.info("暂无训练记录。")
+
+    st.divider()
+
+    if _is_learner_alive():
+        st.warning("参数寻优正在运行中，请先停止后再启动微调训练。")
+    else:
+        start_ft = st.button(
+            "启动微调训练", type="primary", key="ft_start", use_container_width=True
+        )
+        if start_ft:
+            cmd = [
+                sys.executable,
+                str(ROOT_DIR / "scripts" / "finetune_trainer.py"),
+                "--top_k",
+                str(top_k),
+                "--episodes_per_config",
+                str(ep_per_cfg),
+                "--explore_budget",
+                str(explore_budget),
+                "--sigma",
+                str(sigma),
+                "--target_visits",
+                str(target_visits),
+                "--convergence_threshold",
+                str(convergence),
+            ]
+            _kg_file = st.session_state.get("_learner_kg_file", "")
+            _kg_data_dir = st.session_state.get("_learner_kg_data_dir", "")
+            if _kg_file:
+                cmd.extend(["--kg_file", _kg_file])
+            if _kg_data_dir:
+                cmd.extend(["--data_dir", _kg_data_dir])
+            _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+            _FINETUNE_DIR.mkdir(parents=True, exist_ok=True)
+            _FINETUNE_SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
+            _TRIALS_DIR.mkdir(parents=True, exist_ok=True)
+
+            log_path = _FINETUNE_DIR / "finetune_trainer.log"
+            log_file = open(str(log_path), "w", encoding="utf-8")
+            st.session_state.finetune_log_file = log_file
+            flags = 0
+            if sys.platform == "win32":
+                flags = (
+                    subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+                )
+            p = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=log_file,
+                cwd=str(ROOT_DIR),
+                creationflags=flags,
+            )
+            st.session_state.finetune_proc = p
+            _PID_FILE.write_text(str(p.pid))
+            st.toast(f"微调训练已启动 (PID: {p.pid})", icon="🚀")
+            time.sleep(1)
+            st.rerun()
+
+    if "finetune_proc" in st.session_state:
+        proc = st.session_state.finetune_proc
+        if proc and proc.poll() is not None:
+            del st.session_state.finetune_proc
+
+    ft_log = _FINETUNE_DIR / "finetune_trainer.log"
+    if ft_log.exists():
+        if st.button("查看全局训练日志", key="ft_show_log"):
+            _show_log("finetune_runs/finetune_trainer.log")
+
+
+def _show_finetune_jsonl(file_path, title):
+    try:
+        lines = []
+        with open(str(file_path), "r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    if isinstance(data, list):
+                        lines.append(
+                            f"[{i}] ({len(data)} 步) state={data[0].get('state_id', '?')} action={data[0].get('action_code', '?')} ..."
+                        )
+                    else:
+                        lines.append(
+                            f"[{i}] {json.dumps(data, ensure_ascii=False)[:200]}"
+                        )
+                except json.JSONDecodeError:
+                    lines.append(f"[{i}] (解析失败)")
+        show = "\n".join(lines[-50:]) if len(lines) > 50 else "\n".join(lines)
+        st.text_area(title, show, height=300, label_visibility="collapsed")
+    except Exception as e:
+        st.error(f"读取失败: {e}")
+
+
+def _show_qtable_snapshot(file_path):
+    try:
+        data = json.loads(file_path.read_text(encoding="utf-8"))
+        summary_rows = []
+        for sid_str, actions in data.items():
+            total_v = sum(a.get("visits", 0) for a in actions.values())
+            best_ac = (
+                max(actions, key=lambda k: actions[k].get("avg_reward", 0))
+                if actions
+                else "?"
+            )
+            best_r = actions[best_ac].get("avg_reward", 0) if best_ac != "?" else 0
+            summary_rows.append(
+                {
+                    "state_id": sid_str,
+                    "actions": len(actions),
+                    "total_visits": total_v,
+                    "best_action": best_ac,
+                    "best_reward": round(best_r, 2),
+                }
+            )
+        if summary_rows:
+            df = pd.DataFrame(summary_rows)
+            st.dataframe(df, use_container_width=True, height=400)
+        else:
+            st.info("Q-Table 为空。")
+    except Exception as e:
+        st.error(f"读取失败: {e}")
+
+
+def _show_finetune_progress(file_path):
+    try:
+        data = json.loads(file_path.read_text(encoding="utf-8"))
+        st.json(data)
+    except Exception as e:
+        st.error(f"读取失败: {e}")

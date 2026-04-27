@@ -275,7 +275,7 @@ def _analyze_local_result(
     }
 
 
-def _sample_params(trial: optuna.Trial, space: dict) -> dict:
+def _sample_params(trial: optuna.Trial, space: dict, cfg: dict = None) -> dict:
     action_strategy = trial.suggest_categorical(
         "action_strategy", space["action_strategy"]
     )
@@ -336,6 +336,35 @@ def _sample_params(trial: optuna.Trial, space: dict) -> dict:
         )
     else:
         params["epsilon"] = 0.1
+
+    if "masked_count" in space:
+        masked_count = trial.suggest_int(
+            "masked_count", space["masked_count"][0], space["masked_count"][1]
+        )
+        masked_actions = []
+        all_actions = [
+            "4a",
+            "4b",
+            "4c",
+            "4d",
+            "4e",
+            "4f",
+            "4g",
+            "4h",
+            "4i",
+            "4j",
+            "4k",
+        ]
+        for i in range(masked_count):
+            choice = trial.suggest_int(f"mask_{i}", 0, len(all_actions) - 1)
+            if all_actions[choice] not in masked_actions:
+                masked_actions.append(all_actions[choice])
+        params["masked_actions"] = masked_actions
+    else:
+        params["masked_actions"] = []
+
+    if cfg and cfg.get("_fixed_masked_actions"):
+        params["masked_actions"] = cfg["_fixed_masked_actions"]
 
     return params
 
@@ -429,7 +458,7 @@ class ParameterLearner:
             cmd.extend(["--fallback_action", game["fallback_action"]])
 
         log_path = self.trials_dir / "learner.log"
-        log_file = open(str(log_path), "w", encoding="utf-8")
+        log_file = open(str(log_path), "a", encoding="utf-8")
         flags = subprocess.CREATE_NO_WINDOW
         if sys.platform == "win32":
             flags |= subprocess.CREATE_NEW_PROCESS_GROUP
@@ -490,7 +519,7 @@ class ParameterLearner:
 
     def _objective(self, trial: optuna.Trial, study: optuna.Study) -> float:
         space = self.cfg["search_space"]
-        params = _sample_params(trial, space)
+        params = _sample_params(trial, space, self.cfg)
         return self._execute_trial(trial, params)
 
     def _execute_trial(self, trial: optuna.Trial, params: dict) -> float:
@@ -704,6 +733,7 @@ class ParameterLearner:
         send_params["local_result_dir"] = str(trial_dir)
         send_params["target_episodes"] = target_episodes
         send_params["trial_number"] = trial_number
+        send_params["plan_log_path"] = str(trial_dir / "plan.log")
 
         sent = False
         for _attempt in range(5):
@@ -927,6 +957,11 @@ def main():
         default=None,
         help="rerun specified trial with fixed params",
     )
+    parser.add_argument(
+        "--masked_actions",
+        default=None,
+        help="comma-separated masked action codes, e.g. '4a,4k'",
+    )
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
@@ -939,6 +974,13 @@ def main():
         cfg["game"]["kg_file"] = args.kg_file
     if args.data_dir is not None:
         cfg["game"]["data_dir"] = args.data_dir
+
+    if args.masked_actions:
+        cfg["_fixed_masked_actions"] = [
+            a.strip() for a in args.masked_actions.split(",") if a.strip()
+        ]
+    else:
+        cfg["_fixed_masked_actions"] = []
 
     print("=" * 60)
     print("PredictionRTS Parameter Learner (single-start mode)")
