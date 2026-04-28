@@ -126,6 +126,8 @@ def beam_search_predict(
     score_mode: str = "quality",
     max_state_revisits: int = 2,
     discount_factor: float = 0.9,
+    finetune_model: Any = None,
+    dist_matrix: Any = None,
 ) -> List[BeamSearchResult]:
     """
     Beam search over the KG transition graph.
@@ -192,6 +194,23 @@ def beam_search_predict(
                 min_visits=min_visits,
                 metric="quality_score",
             )
+
+            if not top_actions and finetune_model is not None:
+                ft_ranked = finetune_model.rank_actions_by_finetune(
+                    beam.state, dist_matrix
+                )
+                if ft_ranked:
+                    top_actions = [
+                        (
+                            ac,
+                            {
+                                "quality_score": finetune_model.smooth_q(
+                                    beam.state, ac, dist_matrix
+                                )
+                            },
+                        )
+                        for ac in ft_ranked[:candidates_per_action]
+                    ]
 
             if not top_actions:
                 continue
@@ -400,6 +419,8 @@ def plan_action(
     action_strategy: str = "best_beam",
     epsilon: float = 0.1,
     rng_seed: Optional[int] = None,
+    finetune_model: Any = None,
+    dist_matrix: Any = None,
 ) -> PlanResult:
     rng = np.random.RandomState(rng_seed)
 
@@ -414,6 +435,8 @@ def plan_action(
         score_mode=score_mode,
         max_state_revisits=max_state_revisits,
         discount_factor=discount_factor,
+        finetune_model=finetune_model,
+        dist_matrix=dist_matrix,
     )
 
     if not beam_results:
@@ -499,6 +522,8 @@ def find_optimal_action(
     action_strategy: str = "best_beam",
     epsilon: float = 0.1,
     rng_seed: Optional[int] = None,
+    finetune_model: Any = None,
+    dist_matrix: Any = None,
 ) -> Tuple[Optional[str], Dict[str, Any]]:
     plan = plan_action(
         kg,
@@ -514,6 +539,8 @@ def find_optimal_action(
         action_strategy=action_strategy,
         epsilon=epsilon,
         rng_seed=rng_seed,
+        finetune_model=finetune_model,
+        dist_matrix=dist_matrix,
     )
     info: Dict[str, Any] = dict(plan.metrics)
     info["all_results"] = plan.beam_results

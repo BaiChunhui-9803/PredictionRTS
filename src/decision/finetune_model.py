@@ -15,6 +15,7 @@ FinetuneModel — 基于置信度的状态微调机
 
 from __future__ import annotations
 
+import os
 import pickle
 import logging
 from dataclasses import dataclass, field
@@ -24,6 +25,15 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+def save_atomic(model: "FinetuneModel", path: str) -> None:
+    backup = path + ".backup"
+    if os.path.exists(path):
+        os.replace(path, backup)
+    tmp = path + ".tmp"
+    model.save(tmp)
+    os.replace(tmp, path)
 
 
 @dataclass
@@ -193,6 +203,26 @@ class FinetuneModel:
             "trained_episodes": self.trained_episodes,
             "last_trained": self.last_trained,
         }
+
+    def update_batch(self, updates: List[Tuple[int, str, float]]) -> None:
+        dirty_states = set()
+        for state_id, action_code, reward in updates:
+            if state_id is None:
+                continue
+            if state_id not in self.q_table:
+                self.q_table[state_id] = {}
+            if action_code not in self.q_table[state_id]:
+                self.q_table[state_id][action_code] = ActionEstimate()
+            est = self.q_table[state_id][action_code]
+            est.visits += 1
+            est.total_reward += reward
+            est.avg_reward = est.total_reward / est.visits
+            est.confidence = min(1.0, est.visits / self.target_visits)
+            dirty_states.add(state_id)
+        for sid in dirty_states:
+            self._refresh_ranks(sid)
+        self.trained_episodes += len(updates)
+        self.last_trained = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def save(self, path: str) -> None:
         with open(path, "wb") as f:

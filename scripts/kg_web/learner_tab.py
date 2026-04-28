@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import time
 import datetime
+import pickle
 import requests as _requests
 from pathlib import Path
 from typing import Optional, Dict
@@ -475,6 +476,55 @@ def _render_export_button():
         )
 
 
+def _start_learner():
+    if _is_learner_alive():
+        st.error("参数寻优正在运行中，请先停止。")
+        return
+
+    episodes = st.session_state.get("learner_episodes", 100)
+    trials = st.session_state.get("learner_trials", 50)
+    masked = st.session_state.get("learner_masked_actions", [])
+
+    cmd = [
+        sys.executable,
+        str(ROOT_DIR / "scripts" / "parameter_learner.py"),
+        "--trials",
+        str(trials),
+        "--episodes",
+        str(episodes),
+    ]
+    kg_file = st.session_state.get("_learner_kg_file", "")
+    kg_data_dir = st.session_state.get("_learner_kg_data_dir", "")
+    if kg_file:
+        cmd.extend(["--kg_file", kg_file])
+    if kg_data_dir:
+        cmd.extend(["--data_dir", kg_data_dir])
+    if masked:
+        cmd.extend(["--masked_actions", ",".join(masked)])
+
+    _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    _RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    _TRIALS_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = _TRIALS_DIR / "learner.log"
+    log_file = open(str(log_path), "w", encoding="utf-8")
+    st.session_state.learner_log_file = log_file
+    flags = 0
+    if sys.platform == "win32":
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    p = subprocess.Popen(
+        cmd,
+        stdout=log_file,
+        stderr=log_file,
+        cwd=str(ROOT_DIR),
+        creationflags=flags,
+    )
+    st.session_state.learner_proc = p
+    _PID_FILE.write_text(str(p.pid))
+    st.toast(f"参数寻优已启动 (PID: {p.pid})", icon="🚀")
+    time.sleep(1)
+    st.rerun()
+
+
 def _start_rerun(trial_numbers):
     if _is_learner_alive():
         st.error("参数寻优正在运行中，请先停止。")
@@ -863,9 +913,14 @@ def _render_learner_sidebar(kg_entry: Optional[Dict] = None):
     )
 
     if use_finetune:
-        _FINETUNE_MODEL_PATH = _RESULTS_DIR / "finetune_model.pkl"
         model_options = ["(无模型)"]
-        if _FINETUNE_MODEL_PATH.exists():
+        shared_model = _RESULTS_DIR / "shared_finetune_model.pkl"
+        if shared_model.exists():
+            model_options.append("shared_finetune_model.pkl")
+        for p in sorted(_RESULTS_DIR.glob("finetune_model_group_*.pkl")):
+            model_options.append(p.name)
+        old_model_path = _RESULTS_DIR / "finetune_model.pkl"
+        if old_model_path.exists():
             model_options.append("finetune_model.pkl")
 
         st.selectbox(
@@ -898,64 +953,15 @@ def _render_learner_sidebar(kg_entry: Optional[Dict] = None):
 
     st.caption(f"数据目录: `{_RESULTS_DIR}`")
 
-    start_clicked = st.button(
-        "一键启动参数寻优",
-        type="primary",
-        use_container_width=True,
-        key="learner_start",
+    if st.button(
+        "启动参数寻优", type="primary", key="learner_start", use_container_width=True
+    ):
+        _start_learner()
+
+    st.caption(
+        "上方按钮: 独立参数寻优（仅优化 beam search 参数）。"
+        "下方「训练记录与启动」视图: 在线协同训练（参数寻优 + 模型进化同步进行）。"
     )
-
-    if start_clicked:
-        episodes = st.session_state.get("learner_episodes", 100)
-        trials = st.session_state.get("learner_trials", 50)
-
-        cmd = [
-            sys.executable,
-            str(ROOT_DIR / "scripts" / "parameter_learner.py"),
-            "--episodes",
-            str(episodes),
-            "--trials",
-            str(trials),
-        ]
-        if kg_file:
-            cmd.extend(["--kg_file", kg_file])
-        if kg_data_dir:
-            cmd.extend(["--data_dir", kg_data_dir])
-
-        if study:
-            cmd.append("--resume")
-
-        manual_masked = st.session_state.get("learner_masked_actions", [])
-        if manual_masked:
-            cmd.extend(["--masked_actions", ",".join(manual_masked)])
-
-        _save_obj_config(w_win, w_score, alpha, cap)
-
-        _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        _RUNS_DIR.mkdir(parents=True, exist_ok=True)
-        _TRIALS_DIR.mkdir(parents=True, exist_ok=True)
-        if "learner_log_file" in st.session_state:
-            try:
-                st.session_state.learner_log_file.close()
-            except Exception:
-                pass
-        log_path = _TRIALS_DIR / "learner.log"
-        log_file = open(str(log_path), "w", encoding="utf-8")
-        st.session_state.learner_log_file = log_file
-        flags = 0
-        if sys.platform == "win32":
-            flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
-        p = subprocess.Popen(
-            cmd,
-            stdout=log_file,
-            stderr=log_file,
-            cwd=str(ROOT_DIR),
-            creationflags=flags,
-        )
-        st.session_state.learner_proc = p
-        st.toast(f"参数寻优已启动 (PID: {p.pid})", icon="🚀")
-        time.sleep(1)
-        st.rerun()
 
 
 def _get_filtered_trials(study, batch_selection="all"):
@@ -1596,23 +1602,30 @@ def _plot_slice(study, batch_key="all"):
                 groups[v] = []
             if t.value is not None:
                 groups[v].append(t.value)
-        x_vals = []
-        y_vals = []
-        for v in sorted(groups.keys()):
-            x_vals.append(label_map.get(v, v))
-            y_vals.append(groups[v])
-        fig.add_trace(
-            go.Box(
-                y=y_vals,
-                x=x_vals,
-                name=k,
-                boxpoints="outliers",
-                marker=dict(size=3, opacity=0.6),
-                showlegend=False,
-            ),
+        sorted_keys = sorted(groups.keys())
+        labels = [label_map.get(v, v) for v in sorted_keys]
+        for ci, v in enumerate(sorted_keys):
+            fig.add_trace(
+                go.Box(
+                    y=groups[v],
+                    x=[ci] * len(groups[v]),
+                    name=k,
+                    boxpoints="all",
+                    jitter=0.3,
+                    marker=dict(size=3, opacity=0.6),
+                    showlegend=False,
+                ),
+                row=(idx // 2) + 1,
+                col=(idx % 2) + 1,
+            )
+        fig.update_xaxes(
+            tickmode="array",
+            tickvals=list(range(len(sorted_keys))),
+            ticktext=labels,
             row=(idx // 2) + 1,
             col=(idx % 2) + 1,
         )
+    fig.update_yaxes(tickformat=".2f")
     fig.update_layout(
         height=250 * n_rows,
         margin=dict(l=60, r=20, t=30, b=30),
@@ -2278,7 +2291,7 @@ def _render_run_monitor():
 
 
 def _render_learner_tab():
-    st.markdown("### 基于 Optuna 贝叶斯优化的 Beam Search 参数自动寻优")
+    st.markdown("### 在线协同训练：Beam Search 参数寻优 + 微调模型进化")
 
     _migrate_batches()
 
@@ -2316,7 +2329,7 @@ def _render_learner_tab():
             f"**{summary.get('total_trials', 0)} 轮试验 | {summary.get('completed_trials', 0)} 完成**"
         )
     else:
-        st.info("暂无优化数据。在侧边栏配置参数后点击「一键启动参数寻优」。")
+        st.info("暂无优化数据。切换到「训练记录与启动」视图启动在线协同训练。")
 
     if study and len(study.trials) > 0:
         batch_info = _get_batch_info()
@@ -2359,7 +2372,7 @@ def _render_learner_tab():
             else:
                 st.info("暂无批次信息。")
 
-        col_reset, col_grefresh, col_export = st.columns([3, 1, 1])
+        col_reset, col_unlock, col_grefresh, col_export = st.columns([3, 2, 1, 1])
         with col_reset:
             if st.button("重置数据库（清除所有试验记录）", key="learner_reset_db"):
                 try:
@@ -2382,6 +2395,19 @@ def _render_learner_tab():
                     st.rerun()
                 except Exception as e:
                     st.error(f"重置失败: {e}")
+        with col_unlock:
+            if st.button("清除进程锁定", key="learner_unlock"):
+                if _PID_FILE.exists():
+                    _PID_FILE.unlink()
+                try:
+                    _is_learner_alive.clear()
+                except Exception:
+                    pass
+                for k in ("learner_proc", "finetune_proc"):
+                    if k in st.session_state:
+                        del st.session_state[k]
+                st.toast("进程锁定已清除", icon="🔓")
+                st.rerun()
         with col_grefresh:
             if st.button("刷新状态", key="learner_refresh_status"):
                 _load_study.clear()
@@ -2401,7 +2427,7 @@ def _render_learner_tab():
         "参数关系",
         "试验记录",
         "运行状态监测",
-        "微调训练",
+        "训练记录与启动",
     ]
     _VIEW_KEY = "_learner_active_view"
     active_view = st.radio(
@@ -2493,7 +2519,7 @@ def _render_learner_tab():
     elif active_view == "运行状态监测":
         _render_run_monitor()
 
-    elif active_view == "微调训练":
+    elif active_view == "训练记录与启动":
         _render_finetune_tab()
 
 
@@ -2528,54 +2554,82 @@ def _delete_finetune_run(finetune_id: int):
     except Exception:
         pass
 
+    for p in _RESULTS_DIR.glob("finetune_model_group_*.pkl"):
+        p.unlink(missing_ok=True)
+    old_model = _RESULTS_DIR / "finetune_model.pkl"
+    if old_model.exists():
+        old_model.unlink()
+    shared_model = _RESULTS_DIR / "shared_finetune_model.pkl"
+    shared_backup = _RESULTS_DIR / "shared_finetune_model.pkl.backup"
+    shared_model.unlink(missing_ok=True)
+    shared_backup.unlink(missing_ok=True)
+
 
 def _render_finetune_model_overview():
-    model_path = _RESULTS_DIR / "finetune_model.pkl"
-    if not model_path.exists():
+    shared_model = _RESULTS_DIR / "shared_finetune_model.pkl"
+    group_models = sorted(_RESULTS_DIR.glob("finetune_model_group_*.pkl"))
+    old_model = _RESULTS_DIR / "finetune_model.pkl"
+    if old_model.exists():
+        group_models.append(old_model)
+
+    all_models = []
+    if shared_model.exists():
+        all_models.append(shared_model)
+    all_models.extend(group_models)
+
+    if not all_models:
         st.info("尚未训练模型。启动训练后将在此显示模型概览。")
         return
 
     try:
         import pickle
-
-        with open(str(model_path), "rb") as f:
-            model = pickle.load(f)
         from src.decision.finetune_model import FinetuneModel
+    except ImportError:
+        st.error("无法导入 FinetuneModel")
+        return
 
-        if not isinstance(model, FinetuneModel):
-            st.error("模型文件格式不兼容。")
-            return
+    for model_path in all_models:
+        try:
+            with open(str(model_path), "rb") as f:
+                model = pickle.load(f)
+            if not isinstance(model, FinetuneModel):
+                continue
 
-        stats = model.get_overall_stats()
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("已探索状态", f"{stats['explored_states']}/{stats['total_states']}")
-        col2.metric("平均置信度", f"{stats['explored_ratio']:.1%}")
-        col3.metric("平均 RS", f"{stats['avg_replacement_score']:.3f}")
-        col4.metric("训练 Episodes", stats["trained_episodes"])
+            stats = model.get_overall_stats()
+            name = model_path.stem
+            with st.expander(f"模型 {name}", expanded=True):
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric(
+                    "已探索状态", f"{stats['explored_states']}/{stats['total_states']}"
+                )
+                col2.metric("平均置信度", f"{stats['explored_ratio']:.1%}")
+                col3.metric("平均 RS", f"{stats['avg_replacement_score']:.3f}")
+                col4.metric("训练 Episodes", stats["trained_episodes"])
+                st.caption(f"最后训练: {stats.get('last_trained', 'N/A')}")
 
-        st.caption(f"最后训练: {stats.get('last_trained', 'N/A')}")
+                all_scores = []
+                for sid in model.q_table:
+                    for ac in model.q_table[sid]:
+                        all_scores.append(model.replacement_score(sid, ac))
+                if all_scores:
+                    import plotly.graph_objects as go
 
-        all_scores = []
-        for sid in model.q_table:
-            for ac in model.q_table[sid]:
-                all_scores.append(model.replacement_score(sid, ac))
-        if all_scores:
-            import plotly.graph_objects as go
-            import numpy as _np
-
-            fig = go.Figure(
-                data=[go.Histogram(x=all_scores, nbinsx=20, marker_color="steelblue")]
-            )
-            fig.update_layout(
-                xaxis_title="Replacement Score",
-                yaxis_title="State-Action Pairs",
-                height=300,
-                margin=dict(l=40, r=20, t=20, b=40),
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-    except Exception as e:
-        st.error(f"加载模型失败: {e}")
+                    fig = go.Figure(
+                        data=[
+                            go.Histogram(
+                                x=all_scores, nbinsx=20, marker_color="steelblue"
+                            )
+                        ]
+                    )
+                    fig.update_layout(
+                        xaxis_title="Replacement Score",
+                        yaxis_title="State-Action Pairs",
+                        height=300,
+                        margin=dict(l=40, r=20, t=20, b=40),
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.error(f"加载 {model_path.name} 失败: {e}")
 
 
 def _render_finetune_tab():
@@ -2589,15 +2643,16 @@ def _render_finetune_tab():
         st.markdown("**训练配置**")
         top_k = st.number_input("Top-K 参数组合", 1, 20, 5, key="ft_top_k")
         ep_per_cfg = st.number_input("每组 Episodes", 10, 200, 50, key="ft_ep_per_cfg")
-        explore_budget = st.number_input(
-            "探索预算", 50, 5000, 500, step=50, key="ft_budget"
+        reward_mode = st.selectbox(
+            "Reward 模式",
+            ["hp_episodic", "hp", "etg_correct", "etg_offline"],
+            index=0,
+            key="ft_reward_mode",
+            help="hp=纯hp差值; hp_episodic=hp+胜负回溯; etg_correct=ETG修正即时reward; etg_offline=定期ETG校正Q表",
         )
         sigma = st.slider("k-NN sigma", 0.1, 2.0, 0.5, step=0.1, key="ft_sigma")
         target_visits = st.number_input(
             "目标探索次数", 3, 100, 10, key="ft_target_visits"
-        )
-        convergence = st.slider(
-            "收敛阈值", 0.3, 0.9, 0.6, step=0.05, key="ft_convergence"
         )
 
     st.divider()
@@ -2640,9 +2695,7 @@ def _render_finetune_tab():
             else:
                 status_display = f"❓ {status}"
 
-            top_str = ", ".join(f"#{t}" for t in top_trials[:3])
-            if len(top_trials) > 3:
-                top_str += f" (+{len(top_trials) - 3})"
+            top_str = ", ".join(f"#{t}" for t in top_trials)
 
             metric_str = ""
             if model_stats:
@@ -2746,14 +2799,40 @@ def _render_finetune_tab():
                                     )
                                 except Exception:
                                     st.caption("explore_episodes.jsonl")
-                                if st.button(
-                                    "查看探索样本",
-                                    key=f"ft_explore_{fid}",
-                                    use_container_width=True,
-                                ):
-                                    _show_finetune_jsonl(
-                                        explore_ep, f"探索样本 (#{fid:04d})"
-                                    )
+                                if line_count > 0:
+                                    if st.button(
+                                        "查看探索样本",
+                                        key=f"ft_explore_{fid}",
+                                        use_container_width=True,
+                                    ):
+                                        _show_finetune_jsonl(
+                                            explore_ep, f"探索样本 (#{fid:04d})"
+                                        )
+                                else:
+                                    trainer_log = sample_dir / "trainer.log"
+                                    reason = ""
+                                    if trainer_log.exists():
+                                        try:
+                                            log_text = trainer_log.read_text(
+                                                encoding="utf-8"
+                                            )
+                                            if "no more targets" in log_text:
+                                                reason = "Phase B: 所有状态的替代动作已探索完毕"
+                                            elif (
+                                                "no KG" in log_text
+                                                or "no state_action_map" in log_text
+                                            ):
+                                                reason = "Phase B: KG state_action_map 加载失败"
+                                            elif "Phase B" not in log_text:
+                                                reason = (
+                                                    "Phase B 未执行（Phase A 无数据）"
+                                                )
+                                        except Exception:
+                                            pass
+                                    if reason:
+                                        st.caption(f"探索为空 - {reason}")
+                                    else:
+                                        st.caption("探索样本为空")
 
                     qc_path = sample_dir / "q_table_snapshot.json"
                     if qc_path.exists():
@@ -2783,33 +2862,69 @@ def _render_finetune_tab():
                             _show_log(
                                 f"finetune_samples/finetune_{fid:04d}/trainer.log"
                             )
+
+                    group_dirs = sorted(sample_dir.glob("group_*"))
+                    if group_dirs:
+                        for gd in group_dirs:
+                            cand_path = gd / "candidates.json"
+                            if cand_path.exists():
+                                try:
+                                    cands = json.loads(
+                                        cand_path.read_text(encoding="utf-8")
+                                    )
+                                except Exception:
+                                    cands = []
+                                group_name = gd.name
+                                if st.button(
+                                    f"查看候选列表 ({group_name})",
+                                    key=f"ft_cand_{fid}_{group_name}",
+                                    use_container_width=True,
+                                ):
+                                    if cands:
+                                        st.caption(
+                                            f"共 {len(cands)} 个候选（ETG 反事实评估）"
+                                        )
+                                        df = pd.DataFrame(cands)
+                                        st.dataframe(
+                                            df, use_container_width=True, height=400
+                                        )
+                                    else:
+                                        st.info("无候选（所有状态的替代动作收益 <= 0）")
+
+                    base_ep = sample_dir / "base_episodes.jsonl"
+                    qc_path = sample_dir / "q_table_snapshot.json"
+                    if base_ep.exists() and qc_path.exists():
+                        if st.button(
+                            "动作切换收益分析",
+                            key=f"ft_action_switch_{fid}",
+                            use_container_width=True,
+                        ):
+                            _render_action_switch_analysis(sample_dir)
     else:
         st.info("暂无训练记录。")
 
     st.divider()
 
     if _is_learner_alive():
-        st.warning("参数寻优正在运行中，请先停止后再启动微调训练。")
+        st.warning("参数寻优正在运行中，请先停止后再启动训练。")
     else:
         start_ft = st.button(
-            "启动微调训练", type="primary", key="ft_start", use_container_width=True
+            "启动在线协同训练", type="primary", key="ft_start", use_container_width=True
         )
         if start_ft:
             cmd = [
                 sys.executable,
                 str(ROOT_DIR / "scripts" / "finetune_trainer.py"),
-                "--top_k",
+                "--n_trials",
                 str(top_k),
-                "--episodes_per_config",
+                "--episodes_per_trial",
                 str(ep_per_cfg),
-                "--explore_budget",
-                str(explore_budget),
                 "--sigma",
                 str(sigma),
                 "--target_visits",
                 str(target_visits),
-                "--convergence_threshold",
-                str(convergence),
+                "--reward_mode",
+                reward_mode,
             ]
             _kg_file = st.session_state.get("_learner_kg_file", "")
             _kg_data_dir = st.session_state.get("_learner_kg_data_dir", "")
@@ -2839,7 +2954,7 @@ def _render_finetune_tab():
             )
             st.session_state.finetune_proc = p
             _PID_FILE.write_text(str(p.pid))
-            st.toast(f"微调训练已启动 (PID: {p.pid})", icon="🚀")
+            st.toast(f"在线协同训练已启动 (PID: {p.pid})", icon="🚀")
             time.sleep(1)
             st.rerun()
 
@@ -2916,3 +3031,97 @@ def _show_finetune_progress(file_path):
         st.json(data)
     except Exception as e:
         st.error(f"读取失败: {e}")
+
+
+def _render_action_switch_analysis(sample_dir: Path):
+    import pickle as _pickle
+
+    kg_file = st.session_state.get("_learner_kg_file", "")
+    if not kg_file:
+        st.warning("未配置 KG 文件路径，无法分析")
+        return
+    kg_path = ROOT_DIR / "cache" / "knowledge_graph" / kg_file
+    if not kg_path.exists():
+        st.warning(f"KG 文件不存在: {kg_path}")
+        return
+
+    try:
+        with open(str(kg_path), "rb") as f:
+            raw = _pickle.load(f)
+        kg_sam = raw.get("state_action_map", {})
+    except Exception as e:
+        st.error(f"加载 KG 失败: {e}")
+        return
+
+    q_path = sample_dir / "q_table_snapshot.json"
+    base_path = sample_dir / "base_episodes.jsonl"
+    try:
+        q_table = json.loads(q_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        st.error(f"加载 Q-Table 失败: {e}")
+        return
+
+    rows = []
+    ep_idx = 0
+    with open(str(base_path), "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                flow = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            for step_idx, step in enumerate(flow):
+                sid = step.get("state_id")
+                current_ac = step.get("action_code")
+                if sid is None or current_ac is None:
+                    continue
+                if abs(sid) > 10000:
+                    continue
+                sid_int = int(sid)
+                if sid_int not in kg_sam:
+                    continue
+                kg_actions = kg_sam[sid_int]
+                if not kg_actions:
+                    continue
+                current_quality = 0.0
+                if current_ac in kg_actions:
+                    current_quality = getattr(
+                        kg_actions[current_ac], "quality_score", 0.0
+                    )
+                best_alt_ac = None
+                best_alt_quality = -float("inf")
+                for ac, stats in kg_actions.items():
+                    if ac == current_ac:
+                        continue
+                    q = getattr(stats, "quality_score", 0.0)
+                    if q > best_alt_quality:
+                        best_alt_quality = q
+                        best_alt_ac = ac
+                if best_alt_ac is None:
+                    continue
+                gain = best_alt_quality - current_quality
+                if gain > 0:
+                    rows.append(
+                        {
+                            "Episode": ep_idx,
+                            "Step": step_idx,
+                            "State": sid_int,
+                            "当前动作": current_ac,
+                            "当前质量": round(current_quality, 2),
+                            "最优替代": best_alt_ac,
+                            "替代质量": round(best_alt_quality, 2),
+                            "收益差": round(gain, 2),
+                        }
+                    )
+            ep_idx += 1
+
+    if not rows:
+        st.info("未发现可提升的动作切换（当前动作已是 KG 最优，或无替代动作）")
+        return
+
+    rows.sort(key=lambda x: x["收益差"], reverse=True)
+    df = pd.DataFrame(rows)
+    st.caption(f"共发现 {len(rows)} 个可提升的动作切换（按收益差降序）")
+    st.dataframe(df, use_container_width=True, height=400)

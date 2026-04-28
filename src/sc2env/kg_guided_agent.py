@@ -121,6 +121,9 @@ class KGGuidedAgent(SmartAgent):
             "kg_plan": 0,
             "kg_follow": 0,
             "diverge": 0,
+            "ft_plan": 0,
+            "kg_relaxed": 0,
+            "fuzzy_plan": 0,
             "total": 0,
         }
 
@@ -128,6 +131,13 @@ class KGGuidedAgent(SmartAgent):
         self._local_completed: int = 0
 
         self._plan_log_file = None
+
+        self._prev_hp_my: Optional[int] = None
+        self._prev_hp_enemy: Optional[int] = None
+        self._shared_model_path: Optional[str] = None
+        self._ep_action_log: List[Dict[str, Any]] = []
+        self._kg_sam: Optional[Dict[int, Dict]] = None
+        self._ep_completed_count: int = 0
 
         if initial_bktree_data is not None:
             self._load_bktree_from_data(initial_bktree_data)
@@ -188,6 +198,9 @@ class KGGuidedAgent(SmartAgent):
         self._plan_idx = 0
         self._all_beam_states = set()
         self._backup_continuations = {}
+        self._exploration_targets = {}
+        self._exploration_active = False
+        self._exploration_trace = []
 
         if not (self._mode == "replay" and self._replay_actions):
             if not self._prev_end_game_flag and self._ep_history:
@@ -318,6 +331,29 @@ class KGGuidedAgent(SmartAgent):
             return action
         return None
 
+    def _get_finetune_model(self):
+        model_path = self._beam_params.get("finetune_model_path")
+        if not model_path:
+            return None
+        if (
+            hasattr(self, "_cached_ft_model_path")
+            and self._cached_ft_model_path == model_path
+        ):
+            return self._cached_ft_model
+        from pathlib import Path as _Path
+
+        p = _Path(model_path)
+        if not p.exists():
+            return None
+        try:
+            from src.decision.finetune_model import FinetuneModel
+
+            self._cached_ft_model = FinetuneModel.load(str(p))
+            self._cached_ft_model_path = model_path
+            return self._cached_ft_model
+        except Exception:
+            return None
+
     def _get_plan_from_beam(
         self, state_id: int, lookahead_steps: int
     ) -> Tuple[Optional[str], List[str], List[int], List[Dict], List[Dict], List[str]]:
@@ -328,6 +364,9 @@ class KGGuidedAgent(SmartAgent):
             self._write_plan_log(_dbg)
             print(_dbg, flush=True)
             return None, [], [], [], [], []
+
+        finetune_model = self._get_finetune_model()
+        dm = self._dist_matrix
 
         plan = plan_action(
             self.kg,
@@ -341,6 +380,8 @@ class KGGuidedAgent(SmartAgent):
             max_state_revisits=self._beam_params.get("max_state_revisits", 2),
             discount_factor=self._beam_params.get("discount_factor", 0.9),
             action_strategy=self._action_strategy,
+            finetune_model=finetune_model,
+            dist_matrix=dm,
         )
 
         if plan.recommended_action is None:
@@ -415,10 +456,8 @@ class KGGuidedAgent(SmartAgent):
                 }
             )
 
-        finetune_model = self._beam_params.get("finetune_model")
         if finetune_model is not None and plan.action_plan:
             threshold = self._beam_params.get("finetune_threshold", 0.4)
-            dm = self._dist_matrix
             for i, (sid, ac) in enumerate(zip(plan.planned_states, plan.action_plan)):
                 ft_ranked = finetune_model.rank_actions_by_finetune(sid, dm)
                 if not ft_ranked:
@@ -505,36 +544,39 @@ class KGGuidedAgent(SmartAgent):
             self._plan_idx = 0
 
         if self._plan_idx >= len(self._action_plan):
+            trigger = "diverge" if is_diverge else "exhausted"
+
             try:
                 first_action, actions, states, beam_dicts, beam_paths, ranked = (
                     self._get_plan_from_beam(state_id, lookahead)
                 )
-                if not actions:
-                    _msg = f"[PLAN] nid={state_id} trigger={'diverge' if is_diverge else 'exhausted'} -> fallback (empty plan)"
-                    self._write_plan_log(_msg)
-                    return None, "fallback", None
-                self._action_plan = actions
-                self._planned_states = states
-                self._ranked_actions = ranked
-                self._plan_idx = 0
-                plan_snap = {
-                    "state_id": state_id,
-                    "action_plan": actions,
-                    "planned_states": states,
-                    "beam_results": beam_dicts,
-                    "beam_paths": beam_paths,
-                    "mode": "multi_step",
-                    "trigger": "diverge" if is_diverge else "exhausted",
-                }
-                self._last_plan_snap = plan_snap
-                _top3 = ranked[:3] if ranked else []
-                _ap = actions[:3] if actions else []
-                _msg = f"[PLAN] nid={state_id} trigger={'diverge' if is_diverge else 'exhausted'} plan={_ap} ranked={_top3}"
-                self._write_plan_log(_msg)
             except Exception as _pe:
-                _msg = f"[PLAN] nid={state_id} -> fallback (exception: {_pe})"
+                _msg = f"[PLAN] nid={state_id} -> beam exception: {_pe}"
                 self._write_plan_log(_msg)
-                return None, "fallback", None
+                first_action, actions, states = None, [], []
+
+            if not actions:
+                action_code, source = self._fallback_chain(state_id, trigger)
+                return action_code, source, None
+
+            self._action_plan = actions
+            self._planned_states = states
+            self._ranked_actions = ranked
+            self._plan_idx = 0
+            plan_snap = {
+                "state_id": state_id,
+                "action_plan": actions,
+                "planned_states": states,
+                "beam_results": beam_dicts,
+                "beam_paths": beam_paths,
+                "mode": "multi_step",
+                "trigger": trigger,
+            }
+            self._last_plan_snap = plan_snap
+            _top3 = ranked[:3] if ranked else []
+            _ap = actions[:3] if actions else []
+            _msg = f"[PLAN] nid={state_id} trigger={trigger} plan={_ap} ranked={_top3}"
+            self._write_plan_log(_msg)
 
         action = self._action_plan[self._plan_idx]
         if self._plan_idx == 0:
@@ -555,7 +597,7 @@ class KGGuidedAgent(SmartAgent):
                             else action
                         )
                         action = action_code
-                _msg = f"[MASK] nid={state_id} original={_orig} -> replacement={action}"
+                _msg = f"  nid={state_id} original={_orig} -> replacement={action}"
                 self._write_plan_log(_msg)
             if self._plan_idx == 0:
                 event_type = "diverge" if is_diverge else "kg_plan"
@@ -564,18 +606,72 @@ class KGGuidedAgent(SmartAgent):
 
         if (
             self._exploration_active
-            and nid is not None
-            and nid in self._exploration_targets
+            and state_id is not None
+            and state_id in self._exploration_targets
         ):
-            action = self._exploration_targets[nid]
-            self._exploration_trace.append({"state": nid, "action": action})
+            action = self._exploration_targets[state_id]
+            self._exploration_trace.append({"state": state_id, "action": action})
             event_type = "exploration"
-            print(f"[EXPLORATION] nid={nid} forced_action={action}", flush=True)
+            print(
+                f"[EXPLORATION] state_id={state_id} forced_action={action}", flush=True
+            )
+            del self._exploration_targets[state_id]
             if not self._exploration_targets:
                 self._exploration_active = False
 
         self._plan_idx += 1
         return action, event_type, self._last_plan_snap
+
+    def _fallback_chain(self, state_id: int, trigger: str) -> Tuple[Optional[str], str]:
+        finetune_model = self._get_finetune_model()
+
+        if finetune_model is not None:
+            dm = self._dist_matrix
+            ft_ranked = finetune_model.rank_actions_by_finetune(state_id, dm)
+            if ft_ranked:
+                action = ft_ranked[0]
+                _msg = f"[PLAN] nid={state_id} trigger={trigger} -> ft_plan action={action}"
+                self._write_plan_log(_msg)
+                return action, "ft_plan"
+
+        if self.kg is not None:
+            relaxed = self.kg.get_top_k_actions(
+                state=state_id, k=1, min_visits=1, metric="quality_score"
+            )
+            if relaxed:
+                action = relaxed[0][0]
+                _msg = f"[PLAN] nid={state_id} trigger={trigger} -> kg_relaxed action={action}"
+                self._write_plan_log(_msg)
+                return action, "kg_relaxed"
+
+        if self._dist_matrix is not None and self.kg is not None:
+            best_sid = None
+            best_dist = float("inf")
+            for sid in self.kg.unique_states:
+                if sid == state_id:
+                    continue
+                try:
+                    d = float(self._dist_matrix[state_id, sid])
+                except (IndexError, TypeError, KeyError):
+                    continue
+                if np.isnan(d):
+                    continue
+                if d < best_dist:
+                    best_dist = d
+                    best_sid = sid
+            if best_sid is not None and best_dist < 0.3:
+                fuzzy_actions = self.kg.get_top_k_actions(
+                    state=best_sid, k=1, min_visits=1, metric="quality_score"
+                )
+                if fuzzy_actions:
+                    action = fuzzy_actions[0][0]
+                    _msg = f"[PLAN] nid={state_id} trigger={trigger} -> fuzzy_plan matched_sid={best_sid} dist={best_dist:.3f} action={action}"
+                    self._write_plan_log(_msg)
+                    return action, "fuzzy_plan"
+
+        _msg = f"[PLAN] nid={state_id} trigger={trigger} -> fallback (all chains exhausted)"
+        self._write_plan_log(_msg)
+        return None, "fallback"
 
     def _push_status(self, obs, state_cluster_str, my_units, enemy_units):
         if self._frame_count % self._status_push_interval == 0:
@@ -617,6 +713,32 @@ class KGGuidedAgent(SmartAgent):
             progress = {"completed": self._local_completed}
             if target > 0:
                 progress["target"] = target
+            if self._local_completed > 0:
+                c = self._log_counters
+                total = max(c.get("total", 1), 1)
+                progress["fallback_ratio"] = round(
+                    (c.get("fallback", 0) + c.get("nid_none", 0)) / total, 4
+                )
+                progress["explore_ratio"] = round(
+                    (
+                        c.get("ft_plan", 0)
+                        + c.get("kg_relaxed", 0)
+                        + c.get("fuzzy_plan", 0)
+                        + c.get("fallback", 0)
+                    )
+                    / total,
+                    4,
+                )
+                for k in (
+                    "ft_plan",
+                    "kg_relaxed",
+                    "fuzzy_plan",
+                    "kg_plan",
+                    "kg_follow",
+                    "fallback",
+                ):
+                    if k in c:
+                        progress[k] = c[k]
             with open(str(progress_file), "w", encoding="utf-8") as f:
                 _json.dump(progress, f)
         for ep in self._ep_batch:
@@ -642,6 +764,80 @@ class KGGuidedAgent(SmartAgent):
                 self._plan_log_file.flush()
             except Exception:
                 pass
+
+    def _save_shared_model(self) -> None:
+        model = self._get_finetune_model()
+        if model is None:
+            return
+        path = self._shared_model_path
+        if path is None:
+            return
+        try:
+            from src.decision.finetune_model import save_atomic
+
+            save_atomic(model, path)
+        except Exception as e:
+            print(f"[WARN] failed to save shared model: {e}", flush=True)
+
+    def _load_kg_sam(self) -> None:
+        if self._kg_sam is not None:
+            return
+        kg_file = self._beam_params.get("kg_file")
+        data_dir = self._beam_params.get("data_dir")
+        if not kg_file or not data_dir:
+            return
+        try:
+            import pickle as _pickle
+            from src import ROOT_DIR as _ROOT
+
+            kg_path = _ROOT / "cache" / "knowledge_graph" / kg_file
+            if not kg_path.exists():
+                return
+            with open(str(kg_path), "rb") as f:
+                raw = _pickle.load(f)
+            sam = raw.get("state_action_map", {})
+            if sam:
+                self._kg_sam = sam
+                print(f"[KG-SAM] loaded {len(sam)} states for ETG reward", flush=True)
+        except Exception as e:
+            print(f"[WARN] failed to load kg_sam: {e}", flush=True)
+
+    def _etg_recalibrate(self) -> None:
+        model = self._get_finetune_model()
+        if model is None or self._kg_sam is None:
+            return
+        gamma = self._beam_params.get("etg_gamma", 0.9)
+        alpha = self._beam_params.get("etg_recalibrate_alpha", 0.3)
+        corrected = 0
+        for sid, actions in model.q_table.items():
+            if sid not in self._kg_sam:
+                continue
+            for ac, est in actions.items():
+                if ac not in self._kg_sam[sid]:
+                    continue
+                kg_stats = self._kg_sam[sid][ac]
+                try:
+                    etg_v = float(kg_stats.avg_step_reward) + gamma * float(
+                        kg_stats.avg_future_reward
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                correction = alpha * (etg_v - est.avg_reward)
+                est.avg_reward += correction
+                est.total_reward = est.avg_reward * est.visits
+                corrected += 1
+        if corrected > 0:
+            print(
+                f"[ETG-RECAL] corrected {corrected} state-action pairs",
+                flush=True,
+            )
+
+    def _refresh_finetune_model(self) -> None:
+        path = self._beam_params.get("finetune_model_path")
+        if path and path != getattr(self, "_cached_ft_model_path", None):
+            self._cached_ft_model = None
+            self._cached_ft_model_path = None
+            self._shared_model_path = path
 
     def step(self, obs, env):
         from pysc2.lib import actions as sc2_actions
@@ -710,6 +906,13 @@ class KGGuidedAgent(SmartAgent):
 
         if obs.first():
             self._termination_signaled = False
+            self._prev_hp_my = None
+            self._prev_hp_enemy = None
+            self._ep_action_log = []
+            self._refresh_finetune_model()
+            reward_mode = self._beam_params.get("reward_mode", "hp_episodic")
+            if reward_mode in ("etg_correct", "etg_offline"):
+                self._load_kg_sam()
             if not self._initial_spawned:
                 unit_list_my = self.get_my_units_by_type(obs, _MAP["unit_type"])
                 unit_list_enemy = self.get_enemy_units_by_type(obs, _MAP["unit_type"])
@@ -849,13 +1052,20 @@ class KGGuidedAgent(SmartAgent):
             key = action_source if action_source in c else "fallback"
             c[key] = c.get(key, 0) + 1
             if c["total"] % self._log_interval == 0:
+                exploit = c.get("kg_plan", 0) + c.get("kg_follow", 0)
+                explore = (
+                    c.get("ft_plan", 0)
+                    + c.get("kg_relaxed", 0)
+                    + c.get("fuzzy_plan", 0)
+                    + c.get("fallback", 0)
+                )
                 print(
-                    f"[SUMMARY] frames={c['total']} | "
-                    f"nid_none={c['nid_none']} | "
-                    f"fallback={c.get('fallback', 0)} | "
-                    f"kg_plan={c.get('kg_plan', 0)} | "
-                    f"kg_follow={c.get('kg_follow', 0)} | "
-                    f"diverge={c.get('diverge', 0)}",
+                    f"[SUMMARY] frames={c['total']} | nid_none={c['nid_none']} | "
+                    f"exploit={exploit} "
+                    f"(kg_plan={c.get('kg_plan', 0)} kg_follow={c.get('kg_follow', 0)}) | "
+                    f"explore={explore} "
+                    f"(ft_plan={c.get('ft_plan', 0)} kg_relaxed={c.get('kg_relaxed', 0)} "
+                    f"fuzzy_plan={c.get('fuzzy_plan', 0)} fallback={c.get('fallback', 0)})",
                     flush=True,
                 )
 
@@ -871,6 +1081,8 @@ class KGGuidedAgent(SmartAgent):
                     "action": action_to_execute,
                     "action_code": action_code,
                     "action_source": action_source,
+                    "is_exploration": action_source
+                    in ("ft_plan", "kg_relaxed", "fuzzy_plan", "fallback"),
                     "my_count": len(my_units),
                     "enemy_count": len(enemy_units),
                     "hp_my": hp_my,
@@ -890,21 +1102,94 @@ class KGGuidedAgent(SmartAgent):
             )
             self._replay_frame_count += 1
 
+            if self._mode != "replay" and nid is not None:
+                self._ep_action_log.append({"nid": nid, "action_code": action_code})
+
+            if (
+                self._prev_hp_my is not None
+                and self._mode != "replay"
+                and nid is not None
+            ):
+                hp_delta = (hp_my - self._prev_hp_my) - (hp_enemy - self._prev_hp_enemy)
+                reward_mode = self._beam_params.get("reward_mode", "hp_episodic")
+                step_reward = hp_delta
+
+                if reward_mode == "etg_correct" and self._kg_sam is not None:
+                    sam = self._kg_sam
+                    if nid in sam and action_code in sam[nid]:
+                        try:
+                            gamma = self._beam_params.get("etg_gamma", 0.9)
+                            kg_stats = sam[nid][action_code]
+                            etg_expected = float(
+                                kg_stats.avg_step_reward
+                            ) + gamma * float(kg_stats.avg_future_reward)
+                            step_reward = hp_delta - etg_expected
+                        except (AttributeError, TypeError, ValueError):
+                            pass
+
+                ft_model = self._get_finetune_model()
+                if ft_model is not None:
+                    ft_model.update(nid, action_code, float(step_reward))
+
+        self._prev_hp_my = hp_my
+        self._prev_hp_enemy = hp_enemy
+
         end_flag = self.end_game_flag
         if end_flag and not self._prev_end_game_flag:
             if self._ep_history:
                 if self._mode != "replay":
                     c = self._log_counters
+                    exploit_count = c.get("kg_plan", 0) + c.get("kg_follow", 0)
+                    explore_count = (
+                        c.get("ft_plan", 0)
+                        + c.get("kg_relaxed", 0)
+                        + c.get("fuzzy_plan", 0)
+                        + c.get("fallback", 0)
+                    )
                     print(
                         f"[EP-END] ep={self.ctx.episode_count if self.ctx else '?'} "
                         f"result={self.end_game_state} frames={c['total']} | "
-                        f"nid_none={c['nid_none']} fallback={c.get('fallback', 0)} "
-                        f"kg_plan={c.get('kg_plan', 0)} kg_follow={c.get('kg_follow', 0)} "
-                        f"diverge={c.get('diverge', 0)}",
+                        f"exploit={exploit_count} "
+                        f"(kg_plan={c.get('kg_plan', 0)} kg_follow={c.get('kg_follow', 0)}) | "
+                        f"explore={explore_count} "
+                        f"(ft_plan={c.get('ft_plan', 0)} kg_relaxed={c.get('kg_relaxed', 0)} "
+                        f"fuzzy_plan={c.get('fuzzy_plan', 0)} fallback={c.get('fallback', 0)}) | "
+                        f"nid_none={c['nid_none']}",
                         flush=True,
                     )
+
+                    if self._ep_action_log:
+                        ft_model = self._get_finetune_model()
+                        reward_mode = self._beam_params.get(
+                            "reward_mode", "hp_episodic"
+                        )
+                        if ft_model is not None and reward_mode != "hp":
+                            result = self.end_game_state or "Dogfall"
+                            n_steps = len(self._ep_action_log)
+                            if result == "Win":
+                                bonus = 50.0 / n_steps
+                            elif result == "Loss":
+                                bonus = -50.0 / n_steps
+                            else:
+                                bonus = 0.0
+                            if bonus != 0.0:
+                                for entry in self._ep_action_log:
+                                    ft_model.update(
+                                        entry["nid"], entry["action_code"], bonus
+                                    )
+
+                    if self._beam_params.get("reward_mode") == "etg_offline":
+                        self._ep_completed_count += 1
+                        interval = self._beam_params.get("etg_recalibrate_interval", 20)
+                        if self._ep_completed_count % interval == 0:
+                            self._load_kg_sam()
+                            self._etg_recalibrate()
+
+                    self._save_shared_model()
+
                     for k in self._log_counters:
                         self._log_counters[k] = 0
+                    self._ep_action_log = []
                 if self.ctx:
                     self.ctx.episode_count += 1
                 ep_id = self.ctx.episode_count if self.ctx else 0
